@@ -14,4 +14,4 @@ class Finding:
 class RuleResult:
     rule: str
     passed: bool = True
-    findings: list = field(default_factory=list)
+    findings: list[Finding] = field(default_factory=list)

@@ -18,21 +18,9 @@ from pathlib import Path
 try:
     from rules.common import Finding, RuleResult
 except ImportError:
-    from dataclasses import dataclass, field
-
-    @dataclass
-    class Finding:
-        severity: str
-        file: str
-        line: int
-        image: str
-        message: str
-
-    @dataclass
-    class RuleResult:
-        rule: str = "image-manifest-complete"
-        passed: bool = True
-        findings: list = field(default_factory=list)
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from rules.common import Finding, RuleResult
 
 IMAGE_REF_PATTERN = re.compile(
     r'(?:image:\s*|"image":\s*"|FROM\s+)'
@@ -212,9 +200,9 @@ def check_env_var_pattern(
         except (OSError, IndexError):
             line_content = ""
 
-        related_match = RELATED_IMAGE_PATTERN.search(line_content)
+        related_vars = RELATED_IMAGE_PATTERN.findall(line_content)
 
-        if not related_match:
+        if not related_vars:
             relative = str(filepath.relative_to(repo_root))
             severity = "info" if excluded else "warning"
             result.findings.append(Finding(
@@ -226,21 +214,21 @@ def check_env_var_pattern(
                         f"Verify it is covered by an env var elsewhere.",
             ))
         elif manifest_env_vars is not None:
-            var_name = related_match.group()
-            if var_name not in manifest_env_vars:
-                relative = str(filepath.relative_to(repo_root))
-                severity = "info" if excluded else "blocker"
-                if severity == "blocker":
-                    result.passed = False
-                result.findings.append(Finding(
-                    severity=severity,
-                    file=relative,
-                    line=line_num,
-                    image=image,
-                    message=f"Image references '{var_name}' which does not exist "
-                            f"in the operator manifest. The operator will not inject "
-                            f"this image in disconnected environments.",
-                ))
+            for var_name in related_vars:
+                if var_name not in manifest_env_vars:
+                    relative = str(filepath.relative_to(repo_root))
+                    severity = "info" if excluded else "blocker"
+                    if severity == "blocker":
+                        result.passed = False
+                    result.findings.append(Finding(
+                        severity=severity,
+                        file=relative,
+                        line=line_num,
+                        image=image,
+                        message=f"Image references '{var_name}' which does not exist "
+                                f"in the operator manifest. The operator will not inject "
+                                f"this image in disconnected environments.",
+                    ))
 
     if manifest_env_vars is not None:
         stale_vars = local_vars - manifest_env_vars

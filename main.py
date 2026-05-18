@@ -66,6 +66,10 @@ def parse_args(argv=None):
         help="Path to a pre-cloned opendatahub-operator. "
              "If omitted, clones to /tmp/opendatahub-operator when needed.",
     )
+    parser.add_argument(
+        "--output", "-o",
+        help="Write the report to a file instead of stdout.",
+    )
     return parser.parse_args(argv)
 
 
@@ -75,8 +79,7 @@ def resolve_rules(rules_arg):
     keys = [k.strip() for k in rules_arg.split(",")]
     for k in keys:
         if k not in RULE_REGISTRY:
-            print(f"Unknown rule '{k}'. Available: {', '.join(RULE_REGISTRY)}", file=sys.stderr)
-            sys.exit(1)
+            raise SystemExit(f"Unknown rule '{k}'. Available: {', '.join(RULE_REGISTRY)}")
     return keys
 
 
@@ -110,7 +113,7 @@ def adapt_manifest_result(manifest):
                 severity="warning",
                 file="",
                 line=0,
-                image=issue,
+                image="",
                 message=f"Known issue in operator manifest: {issue}",
             ))
     return result
@@ -126,7 +129,7 @@ def compute_score(results):
 
 
 def print_summary(score, results):
-    print(f"\nDisconnected Readiness Score: {score}\n")
+    print(f"\nDisconnected Readiness Score: {score}\n", file=sys.stderr)
     for r in results:
         blockers = sum(1 for f in r.findings if f.severity == "blocker")
         warnings = sum(1 for f in r.findings if f.severity == "warning")
@@ -146,12 +149,12 @@ def print_summary(score, results):
         else:
             summary_msg = "All checks passed"
 
-        print(f"  {tag:<9} {r.rule:<25} {summary_msg}")
+        print(f"  {tag:<9} {r.rule:<25} {summary_msg}", file=sys.stderr)
 
     total_blockers = sum(1 for r in results for f in r.findings if f.severity == "blocker")
     total_warnings = sum(1 for r in results for f in r.findings if f.severity == "warning")
     total_passed = sum(1 for r in results if r.passed)
-    print(f"\nBlockers: {total_blockers} | Warnings: {total_warnings} | Passed: {total_passed}")
+    print(f"\nBlockers: {total_blockers} | Warnings: {total_warnings} | Passed: {total_passed}", file=sys.stderr)
 
 
 def render_json(score, results, repo_name):
@@ -210,6 +213,8 @@ def _render_template_simple(template_str, context):
         var_name = m.group(1)
         collection_name = m.group(2)
         body = m.group(3)
+        if re.search(r'\{%\s*for\s+', body):
+            raise ValueError("Nested {% for %} blocks are not supported by the built-in template renderer.")
         collection = context.get(collection_name, [])
         pieces = []
         for item in collection:
@@ -284,11 +289,13 @@ def main(argv=None):
     manifest_env_vars = None
 
     need_manifest = "manifest" in selected
-    if "csv" in selected:
-        csv_mod = importlib.import_module("rules.csv_relatedimages")
-        pattern = csv_mod.detect_image_pattern(Path(repo_root))
-        if pattern == "env_var":
-            need_manifest = True
+    for key in selected:
+        if RULE_REGISTRY[key].get("needs_manifest"):
+            mod = importlib.import_module(RULE_REGISTRY[key]["module"])
+            pattern = mod.detect_image_pattern(Path(repo_root))
+            if pattern == "env_var":
+                need_manifest = True
+                break
 
     if need_manifest:
         manifest, manifest_env_vars = load_manifest(args.operator_path)
@@ -299,11 +306,9 @@ def main(argv=None):
         mod = importlib.import_module(entry["module"])
 
         if entry.get("is_manifest_rule"):
-            if manifest:
-                results.append(adapt_manifest_result(manifest))
-            else:
+            if manifest is None:
                 manifest, manifest_env_vars = load_manifest(args.operator_path)
-                results.append(adapt_manifest_result(manifest))
+            results.append(adapt_manifest_result(manifest))
             continue
 
         if key == "csv" and manifest_env_vars is not None:
@@ -316,9 +321,15 @@ def main(argv=None):
     print_summary(score, results)
 
     if args.report == "json":
-        print(render_json(score, results, repo_name))
+        report = render_json(score, results, repo_name)
     else:
-        print(render_markdown(score, results, repo_name))
+        report = render_markdown(score, results, repo_name)
+
+    if args.output:
+        Path(args.output).write_text(report + "\n")
+        print(f"\nReport written to {args.output}", file=sys.stderr)
+    else:
+        print(report)
 
     return 0 if score != "NOT READY" else 1
 

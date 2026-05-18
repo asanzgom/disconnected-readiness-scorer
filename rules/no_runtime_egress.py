@@ -7,21 +7,9 @@ from pathlib import Path
 try:
     from rules.common import Finding, RuleResult
 except ImportError:
-    from dataclasses import dataclass, field
-
-    @dataclass
-    class Finding:
-        severity: str
-        file: str
-        line: int
-        image: str
-        message: str
-
-    @dataclass
-    class RuleResult:
-        rule: str = "no-runtime-egress"
-        passed: bool = True
-        findings: list = field(default_factory=list)
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from rules.common import Finding, RuleResult
 
 EGRESS_PATTERNS = {
     ".go": [
