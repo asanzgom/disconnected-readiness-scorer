@@ -44,7 +44,7 @@ All rules output JSON to stdout with `rule`, `passed`, and `findings` fields.
 **Rules:**
 
 - `csv_relatedimages.py` — Auto-detects whether the target repo uses `RELATED_IMAGE_*` env vars (opendatahub-operator pattern) or static CSV `relatedImages`, then checks image completeness against the detected pattern. Accepts optional `manifest_env_vars` parameter — when provided by the orchestrator, cross-references the target repo's env vars against the authoritative operator manifest (blocker for invalid vars, warning for stale vars).
-- `operator_manifest.py` — Parses the opendatahub-operator source to build the authoritative image manifest. Clones the operator repo to `/tmp/opendatahub-operator` if needed. Returns a dict (not RuleResult); the orchestrator adapts it via `adapt_manifest_result()`.
+- `operator_manifest.py` — Parses the opendatahub-operator source to build the authoritative image manifest via `build_manifest()`. Returns a dict (not RuleResult); the orchestrator adapts it via `adapt_manifest_result()`. When no `--operator-path` is provided, `main.py` creates a unique temporary directory with `tempfile.mkdtemp(prefix="odh-operator-")` and clones the operator repo there.
 - `no_image_tags.py` — Enforces `@sha256:` digest refs; rejects mutable tags. Production manifest dirs escalate to blocker severity.
 - `no_runtime_egress.py` — Detects outbound HTTP calls in Go/Python/TS/shell source. Distinguishes hardcoded URLs (blocker) from configurable ones (info). Build-time usage (Dockerfiles, Makefiles, CI) is excluded.
 - `python_imports.py` — Validates Python deps against the known-bundled list. Checks requirements files, `setup.py`, `pyproject.toml`, and runtime `pip install` calls.

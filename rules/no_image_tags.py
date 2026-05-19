@@ -17,7 +17,7 @@ PRODUCTION_DIRS = {"manifests", "deploy", "config", "bundle", "helm", "chart", "
 TEST_DIRS = {"test", "tests", "e2e", "hack", "testdata"}
 CI_DIRS = {".github", ".tekton", "ci"}
 TEST_SUFFIXES = {"_test.go", "_int_test.go", "_internal_test.go"}
-SKIP_FILES = {"semgrep.yaml", "semgrep.yml", ".semgrep.yml"}
+SKIP_FILES = {"semgrep.yaml", "semgrep.yml", ".semgrep.yml", "params.env"}
 
 
 def is_excluded_file(filepath: Path) -> bool:

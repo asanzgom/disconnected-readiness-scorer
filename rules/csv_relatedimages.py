@@ -82,7 +82,7 @@ def extract_related_image_vars(repo_root: Path) -> set[str]:
     for go_file in repo_root.rglob("*.go"):
         if any(d in go_file.parts for d in SKIP_DIRS):
             continue
-        if any(go_file.name.endswith(s) for s in TEST_SUFFIXES):
+        if is_excluded_file(go_file):
             continue
         try:
             content = go_file.read_text()
