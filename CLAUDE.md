@@ -6,6 +6,29 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 A Claude Code skill (plugin) that scores a repository's readiness for disconnected / air-gapped OpenShift deployments. It is invoked as `/disconnected-score` from any RHOAI component repo. The skill definition lives in `SKILL.md`.
 
+## Dependencies
+
+No `requirements.txt` — install test/dev dependencies directly:
+
+```bash
+pip install pytest pytest-cov pyyaml jinja2
+```
+
+`pyyaml` and `jinja2` are optional at runtime (rules/report degrade gracefully without them) but required for full test coverage.
+
+## Testing
+
+```bash
+python -m pytest tests/ -v                                 # all tests
+python -m pytest tests/test_csv_relatedimages.py -v        # single test file
+python -m pytest tests/test_main.py::TestParseArgs -v      # single test class
+python -m pytest tests/ -v --cov=. --cov-report=term       # with coverage
+```
+
+CI runs on Python 3.9 and 3.12 (`.github/workflows/ci.yml`). Codecov enforces 80% patch coverage.
+
+Tests use `tmp_path` fixtures to create disposable repo layouts (Go files, YAML manifests, etc.) and assert on `RuleResult` / `Finding` fields. No external network calls or fixtures needed.
+
 ## Running the Orchestrator
 
 `main.py` runs all (or selected) rules and produces the aggregate score:
@@ -37,7 +60,7 @@ All rules output JSON to stdout with `rule`, `passed`, and `findings` fields.
 
 **Orchestrator (`main.py`):** CLI entry point that imports rules as modules, runs them, computes the aggregate score, and renders output (console summary + markdown or JSON report). Handles the operator manifest lifecycle — only clones when the `csv` rule detects the env_var pattern or when `manifest` is explicitly selected.
 
-**Shared types (`rules/common.py`):** `Finding` and `RuleResult` dataclasses used by all rules. Each rule has a `try/except ImportError` fallback so standalone `python3 rules/foo.py .` still works without the package import.
+**Shared types (`rules/common.py`):** `Finding` and `RuleResult` dataclasses used by all rules. Each rule uses a dual-import pattern: `try: from rules.common import ...` / `except (ImportError, ModuleNotFoundError): from common import ...` so standalone execution (`python3 rules/foo.py .`) works without the package being installed. Tests import via the package path (`from rules.common import ...`).
 
 **Rule engine pattern:** Every rule module under `rules/` exports a `run(repo_root) -> RuleResult` function. `RuleResult` is a dataclass with `rule` (name), `passed` (bool), and `findings` (list of `Finding`). Each `Finding` has `severity` (blocker/warning/info), `file`, `line`, `image`, and `message`.
 
