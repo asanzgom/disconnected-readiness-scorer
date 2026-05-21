@@ -238,6 +238,23 @@ class TestScanForImageRefsExpanded:
         refs = scan_for_image_refs(tmp_path)
         assert len(refs) == 0
 
+    def test_go_module_path_not_matched(self, tmp_path):
+        """Go module paths (github.com/*) should NOT match as container images."""
+        f = tmp_path / "test.json"
+        f.write_text('{"module": "github.com/opendatahub-io/opendatahub-operator"}')
+        refs = scan_for_image_refs(tmp_path)
+        assert len(refs) == 0
+
+    def test_k8s_group_version_not_matched(self, tmp_path):
+        """Kubernetes API GroupVersions should NOT match as container images."""
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "api.go").write_text(
+            'gvr := "openshift.io/gateway-controller/v1"'
+        )
+        refs = scan_for_image_refs(tmp_path)
+        assert len(refs) == 0
+
     def test_finds_shell_export(self, tmp_path):
         f = tmp_path / "setup.sh"
         f.write_text('export IMAGE="quay.io/opendatahub/odh-dashboard:latest"')

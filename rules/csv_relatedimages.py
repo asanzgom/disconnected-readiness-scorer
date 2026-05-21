@@ -46,6 +46,13 @@ DIGEST_PATTERN = re.compile(r'@sha256:[a-f0-9]{64}')
 TAG_PATTERN = re.compile(r':[\w][\w.\-]*$')
 RELATED_IMAGE_PATTERN = re.compile(r'RELATED_IMAGE_[A-Z0-9_]+')
 
+NON_REGISTRY_DOMAINS = {
+    "github.com", "gitlab.com", "bitbucket.org",
+    "golang.org", "google.golang.org", "gopkg.in",
+    "k8s.io", "sigs.k8s.io",
+    "openshift.io",
+}
+
 TEST_DIRS = {"test", "tests", "testdata", "e2e", "hack"}
 TEST_SUFFIXES = {"_test.go", "_int_test.go", "_internal_test.go"}
 CI_DIRS = {".github", ".tekton", "ci"}
@@ -196,7 +203,13 @@ def scan_for_image_refs(repo_root: Path) -> list[tuple[Path, int, str]]:
             for pattern in (IMAGE_REF_PATTERN, GO_IMAGE_ASSIGN_PATTERN):
                 for match in pattern.finditer(line):
                     img = match.group(1).strip().strip('"').strip("'")
-                    if "/" in img and not img.startswith("#") and img not in seen:
+                    domain = img.split("/")[0].split(":")[0]
+                    if (
+                        "/" in img
+                        and not img.startswith("#")
+                        and domain not in NON_REGISTRY_DOMAINS
+                        and img not in seen
+                    ):
                         seen.add(img)
                         results.append((filepath, i, img))
 
