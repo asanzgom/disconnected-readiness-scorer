@@ -675,67 +675,7 @@ class TestParseArgsExceptions:
         assert args.config is None
 
 
-# --- validate_repo_exceptions ---
-
-
-
-
-
-_VALID_REPO_EXCEPTION = {
-    "rule": "no-runtime-egress",
-    "path": "internal/client.go",
-    "reason": "Calls cluster-internal API",
-}
-
-
-def _repo_exception(**overrides):
-    """Build a per-repo exception dict from the valid base, applying overrides."""
-    exc = dict(_VALID_REPO_EXCEPTION)
-    for k, v in overrides.items():
-        if v is None:
-            exc.pop(k, None)
-        else:
-            exc[k] = v
-    return exc
-
-
-class TestValidateRepoExceptions:
-    @pytest.mark.parametrize(
-        "desc, overrides, error_match",
-        [
-            # accepted cases
-            ("valid with path scope", {}, None),
-            ("valid with image scope", {"path": None, "image": "quay.io/org/img:*", "rule": "no-image-tags"}, None),
-            ("valid with message scope", {"path": None, "message": "http.DefaultClient"}, None),
-            ("no reference accepted", {}, None),
-            ("with reference accepted", {"reference": "https://example.com/issue/1"}, None),
-            # rejected cases (rule and reason validated by load_exceptions, not here)
-            ("missing scope filter", {"path": None}, "at least one scope filter"),
-            ("empty string scope filter", {"path": ""}, "at least one scope filter"),
-            ("repo field forbidden", {"repo": "opendatahub-io/odh-dashboard"}, "'repo' field is not allowed"),
-            ("unknown field rejected", {"typo_field": "value"}, "unknown field"),
-            ("missing rule rejected", {"rule": None}, "missing required 'rule' field"),
-            ("missing reason rejected", {"reason": None}, "missing required 'reason' field"),
-            ("non-string path rejected", {"path": 123}, "'path' must be a string"),
-            ("non-string image rejected", {"path": None, "image": 42, "rule": "no-image-tags"}, "'image' must be a string"),
-            ("non-string message rejected", {"path": None, "message": True}, "'message' must be a string"),
-        ],
-        ids=lambda x: x if isinstance(x, str) else "",
-    )
-    def test_validate_repo_exception(self, desc, overrides, error_match):
-        exceptions = [_repo_exception(**overrides)]
-        if error_match is None:
-            validate_repo_exceptions(exceptions, "test.yaml")
-        else:
-            with pytest.raises(ValueError, match=error_match):
-                validate_repo_exceptions(exceptions, "test.yaml")
-
-    def test_non_dict_entry_rejected(self):
-        with pytest.raises(ValueError, match="must be a mapping"):
-            validate_repo_exceptions(["not-a-dict"], "test.yaml")
-
-
-# --- per-repo exception loading ---
+# --- central exception loading ---
 
 
 
@@ -777,7 +717,7 @@ class TestExceptionSnippets:
         ]
         section = _build_false_positive_section(snippets)
         assert "2 blocker findings" in section
-        assert ".disconnected-readiness/config.yaml" in section
+        assert "central config file" in section
         assert "#reporting-false-positives" in section
 
     def test_false_positive_section_singular_for_one_blocker(self):
@@ -791,7 +731,7 @@ class TestExceptionSnippets:
         ])]
         output = render_markdown("NOT READY", results, "test-repo")
         assert "Reporting False Positives" in output
-        assert ".disconnected-readiness/config.yaml" in output
+        assert "central config file" in output
 
     def test_markdown_report_omits_section_when_no_blockers(self):
         results = [RuleResult(rule="r", findings=[
