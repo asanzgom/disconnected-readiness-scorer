@@ -29,14 +29,20 @@ exceptions:
   # Test directories
   - rule: "*"
     paths:
-      - "**/*test*/**"
-      - "**/*tests*/**"
+      - "**/test/**"
+      - "**/tests/**"
+      - "**/test_*/**"
+      - "**/*_test/**"
+      - "**/*_tests/**"
+      - "**/*-test/**"
+      - "**/*-tests/**"
       - "**/testdata/**"
       - "**/testing/**"
       - "**/*e2e*/**"
       - "**/mocks/**"
       - "**/hack/**"
       - "**/fixture/**"
+      - "**/testutil/**"
     reason: "Test/dev directory — not deployed in production"
 
   # Test file patterns
@@ -94,7 +100,10 @@ exceptions:
     paths:
       - "**/Dockerfile"
       - "**/*.Dockerfile"
+      - "**/Dockerfile.*"
       - "**/Containerfile"
+      - "**/*.Containerfile"
+      - "**/Containerfile.*"
     reason: "Build file — build-time only"
 
   # Lint config
@@ -194,7 +203,8 @@ exceptions:
     repo: opendatahub-operator
     paths:
       - "**/snapshots/**"
-    reason: "Test snapshots — not deployed in production"
+      - "**/internal/webhook/envtestutil/**"
+    reason: "Test folders — not deployed in production"
 
   - rule: "*"
     repo: opendatahub-operator

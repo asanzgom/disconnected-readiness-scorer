@@ -102,14 +102,16 @@ def run(repo_root: str, production_scope=None, **_kwargs) -> RuleResult:
     try:
         return _run_impl(root, result, production_scope)
     except Exception as exc:
+        import sys
         import traceback
+        print(traceback.format_exc(), file=sys.stderr)
         result.passed = False
         result.findings.append(Finding(
             severity="blocker",
             file="",
             line=0,
             image="",
-            message=f"Rule crashed: {exc}\n{traceback.format_exc()}",
+            message=f"Rule crashed: {type(exc).__name__}: {exc}",
         ))
         return result
 
@@ -139,8 +141,13 @@ def _run_impl(root: Path, result: RuleResult, production_scope) -> RuleResult:
 
     # Use only central known packages - no per-repo config
     known = KNOWN_BUNDLED
+    seen_req_files: set[Path] = set()
     for pattern in req_patterns:
         for filepath in root.glob(pattern):
+            resolved = filepath.resolve()
+            if resolved in seen_req_files:
+                continue
+            seen_req_files.add(resolved)
             if any(d in filepath.parts for d in SKIP_DIRS) or not _is_tracked(filepath):
                 continue
             if not _in_scope(filepath):

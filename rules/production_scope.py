@@ -13,7 +13,7 @@ from typing import Optional
 
 try:
     from rules.common import ArchAnalyzerResult, ProductionScope
-except (ImportError, ModuleNotFoundError):
+except ModuleNotFoundError:
     from common import ArchAnalyzerResult, ProductionScope
 
 # Extended skip set for scope computation — testdata/docs are never production code.
@@ -422,6 +422,7 @@ def compute_production_scope(
 
     production_dirs: Optional[set[Path]] = None
     production_files: Optional[set[Path]] = None
+    arch_manifest_dirs: set[Path] = set()
     method = ""
 
     # --- arch-analyzer original_sources ---
@@ -452,6 +453,14 @@ def compute_production_scope(
                 all_manifest_files.update(folder_files)
         if all_manifest_files:
             manifest_files = all_manifest_files
+
+    if arch_data and arch_manifest_dirs:
+        for mdir in arch_manifest_dirs:
+            mdir_files = collect_manifest_scope_files(mdir)
+            if mdir_files:
+                if manifest_files is None:
+                    manifest_files = set()
+                manifest_files.update(mdir_files)
 
     # --- Go-embedded YAMLs ---
     embedded_yamls = _collect_go_embedded_yamls(repo_root, production_dirs)

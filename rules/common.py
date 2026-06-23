@@ -207,11 +207,14 @@ def is_non_production_overlay_file(
     resolved = filepath.resolve()
     production_overlays = set(production_scope.overlay_paths)
 
+    in_any_overlay = False
     for overlay_path, files in overlay_file_map.items():
         if resolved in files:
-            return overlay_path not in production_overlays
+            if overlay_path in production_overlays:
+                return False
+            in_any_overlay = True
 
-    return False
+    return in_any_overlay
 
 
 # General source-scanning exclusions. Rules scanning the target repo import this set.

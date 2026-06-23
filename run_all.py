@@ -95,10 +95,10 @@ def clone_operator(dest):
 def _run_arch_analyzer_on_dir(target_dir):
     """Run arch-analyzer binary on a single directory. Returns (dir, ok, error)."""
     json_path = Path(target_dir) / "component-architecture.json"
-    if json_path.exists():
-        json_path.unlink()
 
     try:
+        if json_path.exists():
+            json_path.unlink()
         subprocess.run(
             [ARCH_ANALYZER_BIN, "extract", ".", "--extractors", "docker,kustomize"],
             cwd=str(target_dir),

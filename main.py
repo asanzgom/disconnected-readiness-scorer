@@ -821,7 +821,7 @@ def _run(args, operator_path, *,
             f"Provide one -o per --report format, in the same order."
         )
 
-    exc_args = dict(exceptions=exceptions, exception_hits=exception_hits) if verbose else {}
+    exc_args = dict(exceptions=exceptions, exception_hits=exception_hits)
 
     for i, fmt in enumerate(formats):
         if fmt == "json":
