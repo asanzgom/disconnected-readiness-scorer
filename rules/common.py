@@ -1,8 +1,96 @@
 import subprocess
-import sys
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+
+class Severity(str, Enum):
+    BLOCKER = "blocker"
+    INFO = "info"
+
+
+# ---------------------------------------------------------------------------
+# Arch-analyzer typed output
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CopyInstruction:
+    original_sources: list[str] = field(default_factory=list)
+    manifest_hint: bool = False
+
+
+@dataclass
+class BuildCommand:
+    entry_point: str = ""
+
+
+@dataclass
+class DockerfileInfo:
+    path: str = ""
+    copy_instructions: list[CopyInstruction] = field(default_factory=list)
+    build_commands: list[BuildCommand] = field(default_factory=list)
+
+
+@dataclass
+class KustomizeOverlayRef:
+    overlay_path: str = ""
+    file_path: str = ""
+
+
+@dataclass
+class KustomizeComponent:
+    support_file: str = ""
+    overlay_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ArchAnalyzerResult:
+    dockerfiles: list[DockerfileInfo] = field(default_factory=list)
+    kustomize_overlay_refs: list[KustomizeOverlayRef] = field(default_factory=list)
+    kustomize_components: list[KustomizeComponent] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "ArchAnalyzerResult":
+        dockerfiles = [
+            DockerfileInfo(
+                path=df.get("path", ""),
+                copy_instructions=[
+                    CopyInstruction(
+                        original_sources=(
+                            ci.get("original_sources")
+                            or ci.get("sources") or []
+                        ),
+                        manifest_hint=ci.get("manifest_hint") or False,
+                    )
+                    for ci in (df.get("copy_instructions") or [])
+                ],
+                build_commands=[
+                    BuildCommand(entry_point=bc.get("entry_point") or "")
+                    for bc in (df.get("build_commands") or [])
+                ],
+            )
+            for df in (data.get("dockerfiles") or [])
+        ]
+        overlay_refs = [
+            KustomizeOverlayRef(
+                overlay_path=ref.get("overlay_path") or "",
+                file_path=ref.get("file_path") or "",
+            )
+            for ref in (data.get("kustomize_overlay_refs") or [])
+        ]
+        components = [
+            KustomizeComponent(
+                support_file=comp.get("support_file") or "",
+                overlay_paths=comp.get("overlay_paths") or [],
+            )
+            for comp in (data.get("kustomize_components") or [])
+        ]
+        return cls(
+            dockerfiles=dockerfiles,
+            kustomize_overlay_refs=overlay_refs,
+            kustomize_components=components,
+        )
 
 
 @dataclass
@@ -13,37 +101,33 @@ class Finding:
     image: str
     message: str
 
+    def __post_init__(self):
+        try:
+            self.severity = Severity(self.severity)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid severity '{self.severity}'. "
+                f"Must be one of: {[s.value for s in Severity]}"
+            ) from exc
+
 
 @dataclass
 class RuleResult:
     rule: str
     passed: bool = True
     findings: list[Finding] = field(default_factory=list)
+    files_checked: list[str] = field(default_factory=list)
+    scan_filters: dict = field(default_factory=dict)
 
 
 @dataclass
 class ProductionScope:
-    production_files: set  # resolved absolute Paths of production .go files
-    method: str            # e.g. "go-import-graph"
+    method: str            # e.g. "arch-analyzer-original-sources"
     manifest_files: Optional[set] = None  # resolved YAML paths in kustomize/helm graph
     manifest_source: Optional[str] = None  # e.g. "config" (source folder)
     overlay_paths: Optional[list] = None   # operator-deployed overlay dirs
-
-
-def is_in_production_scope(filepath: Path, production_scope: Optional[ProductionScope]) -> Optional[bool]:
-    """Check whether a ``.go`` file is inside the production scope.
-
-    Returns True (in scope), False (out of scope), or None (unknown / scope
-    not computed).  Only ``.go`` files are evaluated; all other extensions
-    return None so that existing rule logic handles them.
-    """
-    if production_scope is None:
-        return None
-    if not str(filepath).endswith(".go"):
-        return None
-    if not production_scope.production_files:
-        return None
-    return filepath.resolve() in production_scope.production_files
+    production_dirs: Optional[set] = None  # resolved dirs from original_sources (all file types)
+    production_files: Optional[set] = None # resolved individual file paths (e.g. go.mod at repo root)
 
 
 def is_yaml_in_production_scope(filepath: Path, production_scope: Optional[ProductionScope]) -> Optional[bool]:
@@ -60,7 +144,100 @@ def is_yaml_in_production_scope(filepath: Path, production_scope: Optional[Produ
     return filepath.resolve() in production_scope.manifest_files
 
 
+def is_file_in_production_scope(filepath: Path, production_scope: Optional[ProductionScope]) -> Optional[bool]:
+    """Check whether ANY file type is inside the production scope.
+
+    Returns True (in scope), False (out of scope), or None (unknown / scope not computed).
+
+    Checks production_dirs (any file under a production directory) and
+    production_files (individual files like go.mod at repo root).
+    """
+    if production_scope is None:
+        return None
+    has_dirs = bool(production_scope.production_dirs)
+    has_files = bool(production_scope.production_files)
+    if not has_dirs and not has_files:
+        return None
+
+    resolved = filepath.resolve()
+
+    if has_files and resolved in production_scope.production_files:
+        return True
+
+    if has_dirs:
+        for prod_dir in production_scope.production_dirs:
+            try:
+                resolved.relative_to(prod_dir)
+                return True
+            except ValueError:
+                continue
+
+    return False
+
+
+def build_overlay_file_map(
+    arch_data: "ArchAnalyzerResult | None",
+    repo_root: Path,
+) -> dict[str, set[Path]]:
+    """Build overlay path → files map from kustomize_overlay_refs.
+
+    Returns dict mapping overlay path (e.g., 'overlays/odh') to set of resolved file paths.
+    """
+    if not arch_data:
+        return {}
+
+    overlay_map: dict[str, set[Path]] = {}
+    for ref in arch_data.kustomize_overlay_refs:
+        if ref.overlay_path and ref.file_path:
+            resolved = (repo_root / ref.file_path).resolve()
+            overlay_map.setdefault(ref.overlay_path, set()).add(resolved)
+
+    return overlay_map
+
+
+def is_non_production_overlay_file(
+    filepath: Path,
+    production_scope,
+    overlay_file_map: dict[str, set[Path]],
+) -> bool:
+    """Check if file is in a non-production overlay.
+
+    Returns True if file is in an overlay that's not in production_scope.overlay_paths.
+    """
+    if not overlay_file_map or not production_scope or not production_scope.overlay_paths:
+        return False
+
+    resolved = filepath.resolve()
+    production_overlays = set(production_scope.overlay_paths)
+
+    in_any_overlay = False
+    for overlay_path, files in overlay_file_map.items():
+        if resolved in files:
+            if overlay_path in production_overlays:
+                return False
+            in_any_overlay = True
+
+    return in_any_overlay
+
+
+# General source-scanning exclusions. Rules scanning the target repo import this set.
+# Other modules define their own variants:
+#   - operator_manifest.py: minimal subset (operator repo has no .tox/.devcontainer)
+#   - production_scope.py: adds testdata/docs (irrelevant for production scope computation)
 SKIP_DIRS = {".git", "vendor", "node_modules", "__pycache__", ".tox", ".devcontainer"}
+
+
+def production_scope_relative_dirs(production_scope: Optional[ProductionScope], repo_root: Path) -> list[str] | None:
+    if production_scope is None or not production_scope.production_dirs:
+        return None
+    resolved_root = repo_root.resolve()
+    dirs = []
+    for d in sorted(production_scope.production_dirs):
+        try:
+            dirs.append(str(d.relative_to(resolved_root)) + "/")
+        except ValueError:
+            continue
+    return dirs if dirs else None
 
 
 def find_params_env_dirs(root: Path) -> set[Path]:
@@ -109,26 +286,34 @@ def _collect_kustomize_tree(overlay_dir: Path, dirs: set[Path]):
 
 
 
+
+class ConfigError(Exception):
+    """Raised when a config file exists but cannot be read or parsed."""
+
+
 def load_config_file(config_path: Path) -> dict:
-    """Load a YAML config file, returning empty dict if missing."""
+    """Load a YAML config file, returning empty dict if missing.
+
+    Raises ConfigError if the file exists but cannot be read or parsed.
+    """
     import yaml
 
     if not config_path.exists():
         return {}
     try:
         text = config_path.read_text()
-    except (OSError, UnicodeDecodeError):
-        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ConfigError(f"Cannot read {config_path}: {exc}") from exc
     try:
         result = yaml.safe_load(text)
     except yaml.YAMLError as exc:
-        print(f"  Warning: failed to parse {config_path}: {exc}", file=sys.stderr)
-        return {}
+        raise ConfigError(f"Failed to parse {config_path}: {exc}") from exc
     if result is None:
         return {}
     if not isinstance(result, dict):
-        print(f"  Warning: {config_path} must be a YAML mapping, got {type(result).__name__}", file=sys.stderr)
-        return {}
+        raise ConfigError(
+            f"{config_path} must be a YAML mapping, got {type(result).__name__}"
+        )
     return result
 
 

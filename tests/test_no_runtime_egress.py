@@ -161,20 +161,21 @@ class TestRun:
         assert result.findings[0].severity == "info"
         assert "no hardcoded URL" in result.findings[0].message
 
-    def test_production_scope_downgrades_blocker(self, tmp_path):
+    def test_production_scope_skips_out_of_scope(self, tmp_path):
         pkg = tmp_path / "pkg"
         pkg.mkdir()
         f = pkg / "client.go"
         f.write_text('resp, err := http.Get("https://api.external.com/data")')
-        other = tmp_path / "main.go"
+        cmd = tmp_path / "cmd"
+        cmd.mkdir()
+        other = cmd / "main.go"
         other.write_text("package main\n")
         scope = ProductionScope(
-            production_files={other.resolve()}, method="go-import-graph",
+            production_dirs={cmd.resolve()}, method="go-import-graph",
         )
         result = run(str(tmp_path), production_scope=scope)
         assert result.passed is True
-        assert result.findings[0].severity == "info"
-        assert "[out of production scope]" in result.findings[0].message
+        assert len(result.findings) == 0
 
     def test_production_scope_keeps_in_scope_blocker(self, tmp_path):
         pkg = tmp_path / "pkg"
@@ -182,7 +183,7 @@ class TestRun:
         f = pkg / "client.go"
         f.write_text('resp, err := http.Get("https://api.external.com/data")')
         scope = ProductionScope(
-            production_files={f.resolve()},
+            production_dirs={f.parent.resolve()},
             method="go-import-graph",
         )
         result = run(str(tmp_path), production_scope=scope)
@@ -201,7 +202,7 @@ class TestRun:
     def test_production_scope_ignores_non_go(self, tmp_path):
         f = tmp_path / "fetch.py"
         f.write_text('requests.get("https://example.com/api")')
-        scope = ProductionScope(production_files=set(), method="go-import-graph")
+        scope = ProductionScope(method="go-import-graph")
         result = run(str(tmp_path), production_scope=scope)
         assert result.findings[0].severity == "blocker"
 
@@ -257,3 +258,60 @@ class TestRun:
         assert len(result.findings) == 1
         assert result.findings[0].severity == "blocker"
         assert "HuggingFace" in result.findings[0].message
+
+    def test_exec_command_git_in_go(self, tmp_path):
+        f = tmp_path / "clone.go"
+        f.write_text('package main\nfunc f() { exec.Command("git", "clone", repo) }')
+        result = run(str(tmp_path))
+        assert len(result.findings) == 1
+        assert "git" in result.findings[0].message
+
+    def test_from_pretrained_in_python(self, tmp_path):
+        f = tmp_path / "model.py"
+        f.write_text('model = AutoModel.from_pretrained("bert-base")')
+        result = run(str(tmp_path))
+        assert len(result.findings) == 1
+        assert "from_pretrained" in result.findings[0].message
+
+    def test_snapshot_download_in_python(self, tmp_path):
+        f = tmp_path / "dl.py"
+        f.write_text('snapshot_download("model-name")')
+        result = run(str(tmp_path))
+        assert len(result.findings) == 1
+        assert "snapshot_download" in result.findings[0].message
+
+    def test_load_dataset_in_python(self, tmp_path):
+        f = tmp_path / "data.py"
+        f.write_text('ds = load_dataset("squad")')
+        result = run(str(tmp_path))
+        assert len(result.findings) == 1
+        assert "load_dataset" in result.findings[0].message
+
+    def test_sentence_transformer_in_python(self, tmp_path):
+        f = tmp_path / "embed.py"
+        f.write_text('model = SentenceTransformer("all-MiniLM-L6-v2")')
+        result = run(str(tmp_path))
+        assert len(result.findings) == 1
+        assert "SentenceTransformer" in result.findings[0].message
+
+    def test_torch_hub_load_in_python(self, tmp_path):
+        f = tmp_path / "vision.py"
+        f.write_text('model = torch.hub.load("pytorch/vision", "resnet50")')
+        result = run(str(tmp_path))
+        assert len(result.findings) == 1
+        assert "torch.hub.load" in result.findings[0].message
+
+    def test_files_checked_populated(self, tmp_path):
+        f = tmp_path / "main.go"
+        f.write_text('package main\nfunc f() { http.Get("http://example.com") }')
+        result = run(str(tmp_path))
+        assert len(result.files_checked) > 0
+
+    def test_crash_returns_blocker(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(
+            "rules.no_runtime_egress.get_tracked_files",
+            lambda _: (_ for _ in ()).throw(RuntimeError("boom")),
+        )
+        result = run(str(tmp_path))
+        assert result.passed is False
+        assert any("Rule crashed" in f.message for f in result.findings)

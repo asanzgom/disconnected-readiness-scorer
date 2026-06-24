@@ -4,28 +4,6 @@
   "description": "Configuration for the disconnected readiness scanner. Used only by central config (config/config.yaml).",
   "type": "object",
   "properties": {
-    "registries": {
-      "type": "array",
-      "items": { "type": "string" },
-      "description": "Approved internal container registries. Images from these registries are treated as safe. Typically only used in central config."
-    },
-    "known_mirrors": {
-      "type": "object",
-      "description": "Known-safe packages and mirrors for Python dependency validation.",
-      "properties": {
-        "bundled_packages": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Python packages guaranteed available in internal mirrors."
-        },
-        "pypi_mirrors": {
-          "type": "array",
-          "items": { "type": "string", "format": "uri" },
-          "description": "Internal PyPI mirror URLs."
-        }
-      },
-      "additionalProperties": false
-    },
     "exceptions": {
       "type": "array",
       "description": "Exception rules that downgrade matching blocker findings to info severity.",
@@ -41,18 +19,15 @@
             "type": "string",
             "description": "Why this exception exists."
           },
-          "path": {
-            "type": "string",
-            "description": "Glob pattern matched against finding file path."
-          },
           "paths": {
             "type": "array",
             "items": { "type": "string" },
             "description": "List of glob patterns — matches if ANY pattern matches."
           },
-          "image": {
-            "type": "string",
-            "description": "Glob pattern matched against finding image ref."
+          "images": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "List of glob patterns matched against finding image ref. Matches if ANY pattern matches."
           },
           "message": {
             "type": "string",
@@ -70,6 +45,28 @@
         "additionalProperties": false
       }
     },
+    "known_non_image_prefixes": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "String prefixes that look like image references but are YAML annotations or domain labels, not container images. Matches on the full image string (org/name part)."
+    },
+    "docker_contexts": {
+      "type": "object",
+      "description": "Docker build context overrides per repo. Keys are repo basenames (or org/repo). Values are objects mapping Dockerfile path → context directory (both relative to repo root). Used when COPY . . would otherwise resolve to repo root.",
+      "additionalProperties": {
+        "type": "object",
+        "description": "Mapping of Dockerfile path → context directory for a specific repo.",
+        "additionalProperties": { "type": "string" }
+      }
+    },
+    "params_env_filenames": {
+      "type": "object",
+      "description": "Additional params.env-style filenames per repo. Keys are repo basenames (or org/repo). Values are lists of extra filenames to scan beyond the default \"params.env\". Only allowed in central config.",
+      "additionalProperties": {
+        "type": "array",
+        "items": { "type": "string", "minLength": 1 }
+      }
+    }
   },
   "additionalProperties": false
 }

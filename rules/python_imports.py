@@ -6,9 +6,9 @@ from pathlib import Path
 from typing import List, Set
 
 try:
-    from rules.common import Finding, RuleResult, get_tracked_files
+    from rules.common import Finding, RuleResult, get_tracked_files, is_file_in_production_scope, production_scope_relative_dirs
 except ModuleNotFoundError:
-    from common import Finding, RuleResult, get_tracked_files
+    from common import Finding, RuleResult, get_tracked_files, is_file_in_production_scope, production_scope_relative_dirs
 
 GIT_DEP_PATTERN = re.compile(r'git\+https?://[^\s]+')
 PIP_INSTALL_PATTERN = re.compile(r'(?:pip|pip3)\s+install\s+([^\s]+)')
@@ -96,25 +96,63 @@ def check_runtime_pip_installs(filepath: Path, root: Path) -> List[Finding]:
     return findings
 
 
-def run(repo_root: str, **_kwargs) -> RuleResult:
+def run(repo_root: str, production_scope=None, **_kwargs) -> RuleResult:
     root = Path(repo_root)
     result = RuleResult(rule="python-imports-bundled")
+    try:
+        return _run_impl(root, result, production_scope)
+    except Exception as exc:
+        import sys
+        import traceback
+        print(traceback.format_exc(), file=sys.stderr)
+        result.passed = False
+        result.findings.append(Finding(
+            severity="blocker",
+            file="",
+            line=0,
+            image="",
+            message=f"Rule crashed: {type(exc).__name__}: {exc}",
+        ))
+        return result
+
+
+def _run_impl(root: Path, result: RuleResult, production_scope) -> RuleResult:
     tracked = get_tracked_files(root)
 
     def _is_tracked(fp: Path) -> bool:
         return tracked is None or fp.resolve() in tracked
 
-    # Use only central known packages - no per-repo config
-    known = KNOWN_BUNDLED
+    def _in_scope(fp: Path) -> bool:
+        return is_file_in_production_scope(fp, production_scope) is not False
 
     req_patterns = [
         "requirements*.txt", "constraints*.txt",
         "**/requirements*.txt", "**/constraints*.txt",
     ]
+    all_globs = req_patterns + ["**/*.py", "**/setup.py", "**/pyproject.toml"]
+    result.scan_filters = {
+        "globs": all_globs,
+        "skip_dirs": sorted(SKIP_DIRS),
+        "tracked_files_only": tracked is not None,
+    }
+    prod_dirs = production_scope_relative_dirs(production_scope, root)
+    if prod_dirs is not None:
+        result.scan_filters["production_scope_dirs"] = prod_dirs
+
+    # Use only central known packages - no per-repo config
+    known = KNOWN_BUNDLED
+    seen_req_files: set[Path] = set()
     for pattern in req_patterns:
         for filepath in root.glob(pattern):
+            resolved = filepath.resolve()
+            if resolved in seen_req_files:
+                continue
+            seen_req_files.add(resolved)
             if any(d in filepath.parts for d in SKIP_DIRS) or not _is_tracked(filepath):
                 continue
+            if not _in_scope(filepath):
+                continue
+            result.files_checked.append(str(filepath.relative_to(root)))
             for finding in check_requirements_file(filepath, root, known):
                 result.findings.append(finding)
                 if finding.severity == "blocker":
@@ -123,6 +161,9 @@ def run(repo_root: str, **_kwargs) -> RuleResult:
     for filepath in root.rglob("*.py"):
         if any(d in filepath.parts for d in SKIP_DIRS) or not _is_tracked(filepath):
             continue
+        if not _in_scope(filepath):
+            continue
+        result.files_checked.append(str(filepath.relative_to(root)))
         for finding in check_runtime_pip_installs(filepath, root):
             result.findings.append(finding)
             if finding.severity == "blocker":
@@ -133,6 +174,9 @@ def run(repo_root: str, **_kwargs) -> RuleResult:
     for filepath in setup_files + pyproject_files:
         if any(d in filepath.parts for d in SKIP_DIRS) or not _is_tracked(filepath):
             continue
+        if not _in_scope(filepath):
+            continue
+        result.files_checked.append(str(filepath.relative_to(root)))
         try:
             content = filepath.read_text()
             for match in GIT_DEP_PATTERN.finditer(content):

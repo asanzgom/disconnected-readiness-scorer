@@ -3,21 +3,22 @@
 # Central configuration for the disconnected readiness scanner.
 # Applies to all scanned repos unless scoped by 'repo' field.
 
-registries:
-  - registry.redhat.io
-  - brew.registry.redhat.io
-  - quay.io/opendatahub
-  - quay.io/modh
-  - registry.access.redhat.com
-  - image-registry.openshift-image-registry.svc
+# Docker build context overrides for repos where COPY . . would otherwise
+# resolve to repo root (making scope detection too broad).
+# Format: dockerfile_path (relative to repo root) → context_dir (relative to repo root)
+# Keyed by repo basename (or org/repo). Applied before Go/JS heuristics.
+docker_contexts: {}
 
-known_mirrors:
-  bundled_packages:
-    - codeflare-sdk
-    - odh-manifest
-    - opendatahub-operator
-  pypi_mirrors:
-    - https://pypi.corp.redhat.com/simple/
+# Strings that look like image references (org/name:tag) but are YAML annotations,
+# field role labels, or domain-specific identifiers — not container images.
+known_non_image_prefixes:
+  - "feast.io/"
+  - "kubeflow.org/"
+  - "k8s.io/"
+
+params_env_filenames:
+  notebooks:
+    - params-latest.env
 
 exceptions:
 
@@ -29,12 +30,20 @@ exceptions:
   - rule: "*"
     paths:
       - "**/test/**"
-      - "**/*tests*/**"
+      - "**/tests/**"
+      - "**/test_*/**"
+      - "**/*_test/**"
+      - "**/*_tests/**"
+      - "**/*-test/**"
+      - "**/*-tests/**"
       - "**/testdata/**"
       - "**/testing/**"
       - "**/*e2e*/**"
       - "**/mocks/**"
       - "**/hack/**"
+      - "**/fixture/**"
+      - "**/testutil/**"
+      - "**/loadtest/**"
     reason: "Test/dev directory — not deployed in production"
 
   # Test file patterns
@@ -68,6 +77,7 @@ exceptions:
       - "**/examples/**"
       - "**/samples/**"
       - "**/demo/**"
+      - "**/dev_tools/**"
     reason: "Non-production content — not deployed in production"
 
   # OLM scorecard config
@@ -91,7 +101,10 @@ exceptions:
     paths:
       - "**/Dockerfile"
       - "**/*.Dockerfile"
+      - "**/Dockerfile.*"
       - "**/Containerfile"
+      - "**/*.Containerfile"
+      - "**/Containerfile.*"
     reason: "Build file — build-time only"
 
   # Lint config
@@ -132,11 +145,10 @@ exceptions:
     reason: "Build-time utilities and CI scripts — not deployed in production"
 
   # --- kserve ---
-  - rule: "*"
+  - rule: params-env-wiring
     repo: kserve
-    paths:
-      - "**/install/**"
-    reason: "Upstream versioned install scripts — not used by operator-managed deployments"
+    message: "*ConfigMap/inferenceservice-config{key:_example}*"
+    reason: "_example is a documentation-only field in inferenceservice-config — not functional configuration"
 
   # --- kuberay ---
   # (no repo-specific exceptions)
@@ -196,4 +208,14 @@ exceptions:
     repo: opendatahub-operator
     paths:
       - "**/snapshots/**"
-    reason: "Test snapshots — not deployed in production"
+      - "**/internal/webhook/envtestutil/**"
+    reason: "Test folders — not deployed in production"
+
+  - rule: "*"
+    repo: opendatahub-operator
+    paths:
+      - "config/**"
+    images:
+      - REPLACE_IMAGE:v0.0.0-placeholder
+      - REPLACE_IMAGE:v0.0.0-rhoai-placeholder
+    reason: "Test kustomize overlays — not deployed in production"

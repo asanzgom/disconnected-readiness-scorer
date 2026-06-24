@@ -1,417 +1,90 @@
 """Tests for rules/production_scope.py"""
 
-from pathlib import Path
-from unittest.mock import patch, MagicMock
 import json
-import subprocess
+from pathlib import Path
 
-from rules.common import ProductionScope, is_in_production_scope, is_yaml_in_production_scope
+from rules.common import ArchAnalyzerResult, ProductionScope, is_file_in_production_scope, is_yaml_in_production_scope
 from rules.production_scope import (
-    _parse_dockerfile,
-    _find_all_dockerfiles,
-    _find_go_entrypoints_heuristic,
-    _go_list_deps,
-    _iter_json_objects,
-    _join_continuations,
     _collect_go_embedded_yamls,
+    _extract_production_sources_from_arch_data,
+    _find_go_module_dir,
+    _glob_source,
+    _is_glob_source,
+    _is_js_monorepo,
+    _nearest_package_json_dir,
+    _normalize_glob,
     collect_manifest_scope_files,
     compute_production_scope,
 )
-from rules.operator_manifest import parse_component_manifest_mapping
+from rules.operator_manifest import parse_manifest_entries
 
 
 # ---------------------------------------------------------------------------
 # _join_continuations
 # ---------------------------------------------------------------------------
 
-class TestJoinContinuations:
-    def test_no_continuations(self):
-        assert _join_continuations(["a", "b"]) == ["a", "b"]
-
-    def test_single_continuation(self):
-        result = _join_continuations(["RUN go build \\", "  -o /bin ./cmd/m"])
-        assert result == ["RUN go build    -o /bin ./cmd/m"]
-
-    def test_multi_continuation(self):
-        result = _join_continuations(["RUN a \\", "  b \\", "  c"])
-        assert result == ["RUN a    b    c"]
-
-
-# ---------------------------------------------------------------------------
-# _parse_dockerfile
-# ---------------------------------------------------------------------------
-
-class TestParseDockerfile:
-    def test_simple_go_build(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM golang:1.21 AS builder\n"
-            "COPY . .\n"
-            "RUN go build -o /manager ./cmd/manager\n"
-            "\n"
-            "FROM registry.access.redhat.com/ubi9/ubi-minimal:latest\n"
-            "COPY --from=builder /manager /manager\n"
-            "ENTRYPOINT [\"/manager\"]\n"
-        )
-        assert _parse_dockerfile(df) == ["./cmd/manager"]
-
-    def test_multi_stage_collects_all(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM golang:1.21 AS tools\n"
-            "RUN go build -o /lint ./cmd/lint\n"
-            "\n"
-            "FROM golang:1.21 AS builder\n"
-            "RUN go build -o /app ./cmd/app\n"
-            "\n"
-            "FROM ubi9\n"
-            "COPY --from=builder /app /app\n"
-        )
-        assert _parse_dockerfile(df) == ["./cmd/lint", "./cmd/app"]
-
-    def test_numeric_copy_from(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM golang:1.21\n"
-            "RUN go build -o /svc ./cmd/svc\n"
-            "\n"
-            "FROM ubi9\n"
-            "COPY --from=0 /svc /svc\n"
-        )
-        assert _parse_dockerfile(df) == ["./cmd/svc"]
-
-    def test_no_go_build(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM python:3.11\n"
-            "COPY . /app\n"
-            "RUN pip install -r requirements.txt\n"
-        )
-        assert _parse_dockerfile(df) == []
-
-    def test_line_continuation(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM golang:1.21 AS builder\n"
-            "RUN CGO_ENABLED=0 go build \\\n"
-            "  -ldflags '-s -w' \\\n"
-            "  -o /ctrl ./cmd/controller\n"
-            "\n"
-            "FROM ubi9\n"
-            "COPY --from=builder /ctrl /ctrl\n"
-        )
-        assert _parse_dockerfile(df) == ["./cmd/controller"]
-
-    def test_comments_skipped(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM golang:1.21 AS builder\n"
-            "# RUN go build -o /fake ./cmd/fake\n"
-            "RUN go build -o /real ./cmd/real\n"
-            "\n"
-            "FROM ubi9\n"
-            "COPY --from=builder /real /real\n"
-        )
-        assert _parse_dockerfile(df) == ["./cmd/real"]
-
-    def test_dot_package(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM golang:1.21\n"
-            "RUN go build -o /app .\n"
-        )
-        assert _parse_dockerfile(df) == ["."]
-
-    def test_missing_file(self, tmp_path):
-        assert _parse_dockerfile(tmp_path / "no-such-file") == []
-
-    def test_multiple_builds_same_stage(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM golang:1.21 AS builder\n"
-            "RUN go build -o /manager ./cmd/manager\n"
-            "RUN go build -o /webhook ./cmd/webhook\n"
-            "\n"
-            "FROM ubi9\n"
-            "COPY --from=builder /manager /manager\n"
-        )
-        assert _parse_dockerfile(df) == ["./cmd/manager", "./cmd/webhook"]
-
-    def test_deduplicates_packages(self, tmp_path):
-        df = tmp_path / "Dockerfile"
-        df.write_text(
-            "FROM golang:1.21 AS builder\n"
-            "RUN go build -o /mgr ./cmd/manager\n"
-            "RUN go build -o /mgr2 ./cmd/manager\n"
-        )
-        assert _parse_dockerfile(df) == ["./cmd/manager"]
-
-
-# ---------------------------------------------------------------------------
-# _find_all_dockerfiles
-# ---------------------------------------------------------------------------
-
-class TestFindAllDockerfiles:
-    def test_root_dockerfile(self, tmp_path):
-        (tmp_path / "Dockerfile").write_text("FROM ubi9\n")
-        result = _find_all_dockerfiles(tmp_path)
-        assert result == [tmp_path / "Dockerfile"]
-
-    def test_containerfile(self, tmp_path):
-        (tmp_path / "Containerfile").write_text("FROM ubi9\n")
-        result = _find_all_dockerfiles(tmp_path)
-        assert result == [tmp_path / "Containerfile"]
-
-    def test_build_dir_found(self, tmp_path):
-        bd = tmp_path / "build"
-        bd.mkdir()
-        (bd / "Dockerfile").write_text("FROM ubi9\n")
-        result = _find_all_dockerfiles(tmp_path)
-        assert result == [bd / "Dockerfile"]
-
-    def test_root_preferred_over_build(self, tmp_path):
-        (tmp_path / "Dockerfile").write_text("FROM ubi9\n")
-        bd = tmp_path / "build"
-        bd.mkdir()
-        (bd / "Dockerfile").write_text("FROM ubi9\n")
-        result = _find_all_dockerfiles(tmp_path)
-        assert result[0] == tmp_path / "Dockerfile"
-
-    def test_no_dockerfile(self, tmp_path):
-        assert _find_all_dockerfiles(tmp_path) == []
-
-
-# ---------------------------------------------------------------------------
-# _find_go_entrypoints_heuristic
-# ---------------------------------------------------------------------------
-
-class TestFindGoEntrypointsHeuristic:
-    def test_single_cmd(self, tmp_path):
-        (tmp_path / "go.mod").write_text("module example.com/repo\n")
-        cmd = tmp_path / "cmd" / "manager"
-        cmd.mkdir(parents=True)
-        (cmd / "main.go").write_text("package main\n")
-        result = _find_go_entrypoints_heuristic(tmp_path)
-        assert len(result) == 1
-        assert result[0][0] == "./cmd/manager"
-
-    def test_multiple_cmds_picks_first_alphabetically(self, tmp_path):
-        (tmp_path / "go.mod").write_text("module example.com/repo\n")
-        for name in ["zebra", "alpha"]:
-            d = tmp_path / "cmd" / name
-            d.mkdir(parents=True)
-            (d / "main.go").write_text("package main\n")
-        result = _find_go_entrypoints_heuristic(tmp_path)
-        assert len(result) == 2
-        assert result[0][0] == "./cmd/alpha"
-
-    def test_no_cmd_dir(self, tmp_path):
-        assert _find_go_entrypoints_heuristic(tmp_path) == []
-
-    def test_cmd_without_main_go(self, tmp_path):
-        (tmp_path / "go.mod").write_text("module example.com/repo\n")
-        cmd = tmp_path / "cmd" / "tool"
-        cmd.mkdir(parents=True)
-        (cmd / "helper.go").write_text("package main\n")
-        assert _find_go_entrypoints_heuristic(tmp_path) == []
-
-
-# ---------------------------------------------------------------------------
-# _iter_json_objects
-# ---------------------------------------------------------------------------
-
-class TestIterJsonObjects:
-    def test_single_object(self):
-        objs = list(_iter_json_objects('{"a": 1}'))
-        assert objs == [{"a": 1}]
-
-    def test_multiple_objects(self):
-        text = '{"a": 1}\n{"b": 2}\n'
-        objs = list(_iter_json_objects(text))
-        assert objs == [{"a": 1}, {"b": 2}]
-
-    def test_empty(self):
-        assert list(_iter_json_objects("")) == []
-
-    def test_whitespace_only(self):
-        assert list(_iter_json_objects("   \n  ")) == []
-
-
-# ---------------------------------------------------------------------------
-# _go_list_deps
-# ---------------------------------------------------------------------------
-
-class TestGoListDeps:
-    def test_success(self, tmp_path):
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        pkg_dir = repo / "cmd" / "svc"
-        pkg_dir.mkdir(parents=True)
-        (pkg_dir / "main.go").write_text("package main\n")
-
-        go_list_output = json.dumps({
-            "Dir": str(pkg_dir),
-            "ImportPath": "example.com/repo/cmd/svc",
-            "GoFiles": ["main.go"],
-        })
-
-        with patch("rules.production_scope.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=go_list_output,
-            )
-            result = _go_list_deps(repo, "./cmd/svc")
-
-        assert result is not None
-        assert (pkg_dir / "main.go").resolve() in result
-
-    def test_includes_cgo_files(self, tmp_path):
-        repo = tmp_path / "repo"
-        repo.mkdir()
-        pkg_dir = repo / "pkg" / "native"
-        pkg_dir.mkdir(parents=True)
-
-        go_list_output = json.dumps({
-            "Dir": str(pkg_dir),
-            "ImportPath": "example.com/repo/pkg/native",
-            "GoFiles": ["pure.go"],
-            "CgoFiles": ["bridge.go"],
-        })
-
-        with patch("rules.production_scope.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout=go_list_output)
-            result = _go_list_deps(repo, "./cmd/svc")
-
-        assert result is not None
-        assert (pkg_dir / "pure.go").resolve() in result
-        assert (pkg_dir / "bridge.go").resolve() in result
-
-    def test_excludes_external_packages(self, tmp_path):
-        repo = tmp_path / "repo"
-        repo.mkdir()
-
-        go_list_output = json.dumps({
-            "Dir": "/usr/local/go/src/fmt",
-            "ImportPath": "fmt",
-            "GoFiles": ["format.go"],
-        })
-
-        with patch("rules.production_scope.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout=go_list_output)
-            result = _go_list_deps(repo, "./cmd/svc")
-
-        assert result is None  # no files under repo → None
-
-    def test_go_not_installed(self, tmp_path):
-        with patch("rules.production_scope.subprocess.run", side_effect=FileNotFoundError):
-            assert _go_list_deps(tmp_path, "./cmd/svc") is None
-
-    def test_nonzero_exit(self, tmp_path):
-        with patch("rules.production_scope.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="error")
-            assert _go_list_deps(tmp_path, "./cmd/svc") is None
-
-    def test_timeout(self, tmp_path):
-        with patch("rules.production_scope.subprocess.run", side_effect=subprocess.TimeoutExpired("go", 60)):
-            assert _go_list_deps(tmp_path, "./cmd/svc") is None
-
-
-# ---------------------------------------------------------------------------
-# compute_production_scope
-# ---------------------------------------------------------------------------
-
-class TestComputeProductionScope:
-    def test_full_pipeline(self, tmp_path):
-        (tmp_path / "go.mod").write_text("module example.com/repo\n")
-        (tmp_path / "Dockerfile").write_text(
-            "FROM golang:1.21 AS builder\n"
-            "RUN go build -o /mgr ./cmd/manager\n"
-            "FROM ubi9\n"
-            "COPY --from=builder /mgr /mgr\n"
-        )
-        pkg_dir = tmp_path / "cmd" / "manager"
-        pkg_dir.mkdir(parents=True)
-        (pkg_dir / "main.go").write_text("package main\n")
-
-        go_list_output = json.dumps({
-            "Dir": str(pkg_dir),
-            "ImportPath": "example.com/repo/cmd/manager",
-            "GoFiles": ["main.go"],
-        })
-
-        with patch("rules.production_scope.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout=go_list_output)
-            scope = compute_production_scope(tmp_path)
-
-        assert scope is not None
-        assert scope.method == "go-import-graph"
-        assert (pkg_dir / "main.go").resolve() in scope.production_files
-
-    def test_no_dockerfile_uses_heuristic(self, tmp_path):
-        (tmp_path / "go.mod").write_text("module example.com/repo\n")
-        pkg_dir = tmp_path / "cmd" / "ctrl"
-        pkg_dir.mkdir(parents=True)
-        (pkg_dir / "main.go").write_text("package main\n")
-
-        go_list_output = json.dumps({
-            "Dir": str(pkg_dir),
-            "ImportPath": "example.com/repo/cmd/ctrl",
-            "GoFiles": ["main.go"],
-        })
-
-        with patch("rules.production_scope.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout=go_list_output)
-            scope = compute_production_scope(tmp_path)
-
-        assert scope is not None
-        assert (pkg_dir / "main.go").resolve() in scope.production_files
-
-    def test_no_entrypoint_returns_none(self, tmp_path):
-        assert compute_production_scope(tmp_path) is None
-
-    def test_go_list_fails_returns_none(self, tmp_path):
-        pkg_dir = tmp_path / "cmd" / "svc"
-        pkg_dir.mkdir(parents=True)
-        (pkg_dir / "main.go").write_text("package main\n")
-
-        with patch("rules.production_scope.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="err")
-            scope = compute_production_scope(tmp_path)
-
-        assert scope is None
-
-
-# ---------------------------------------------------------------------------
-# is_in_production_scope (from common.py)
-# ---------------------------------------------------------------------------
 
 class TestIsInProductionScope:
     def test_none_scope(self):
-        assert is_in_production_scope(Path("foo.go"), None) is None
+        assert is_file_in_production_scope(Path("foo.go"), None) is None
 
     def test_non_go_file(self):
-        scope = ProductionScope(production_files=set(), method="test")
-        assert is_in_production_scope(Path("foo.py"), scope) is None
+        scope = ProductionScope(method="test")
+        assert is_file_in_production_scope(Path("foo.py"), scope) is None
 
     def test_go_file_in_scope(self, tmp_path):
         f = tmp_path / "main.go"
         f.write_text("")
-        scope = ProductionScope(production_files={f.resolve()}, method="test")
-        assert is_in_production_scope(f, scope) is True
+        scope = ProductionScope(production_dirs={f.parent.resolve()}, method="test")
+        assert is_file_in_production_scope(f, scope) is True
 
     def test_go_file_out_of_scope_empty_set(self, tmp_path):
         f = tmp_path / "tool.go"
         f.write_text("")
-        scope = ProductionScope(production_files=set(), method="test")
-        assert is_in_production_scope(f, scope) is None
+        scope = ProductionScope(method="test")
+        assert is_file_in_production_scope(f, scope) is None
 
     def test_go_file_out_of_scope(self, tmp_path):
-        f = tmp_path / "tool.go"
+        tools_dir = tmp_path / "tools"
+        tools_dir.mkdir()
+        f = tools_dir / "tool.go"
         f.write_text("")
-        other = tmp_path / "main.go"
+        cmd_dir = tmp_path / "cmd"
+        cmd_dir.mkdir()
+        other = cmd_dir / "main.go"
         other.write_text("")
-        scope = ProductionScope(production_files={other.resolve()}, method="test")
-        assert is_in_production_scope(f, scope) is False
+        scope = ProductionScope(production_dirs={cmd_dir.resolve()}, method="test")
+        assert is_file_in_production_scope(f, scope) is False
+
+    def test_file_in_production_files_returns_true(self, tmp_path):
+        f = tmp_path / "go.mod"
+        f.write_text("module example.com\n")
+        scope = ProductionScope(production_files={f.resolve()}, method="test")
+        assert is_file_in_production_scope(f, scope) is True
+
+    def test_file_not_in_production_files_returns_false(self, tmp_path):
+        f = tmp_path / "go.mod"
+        f.write_text("module example.com\n")
+        other = tmp_path / "tools" / "go.mod"
+        scope = ProductionScope(production_files={f.resolve()}, method="test")
+        assert is_file_in_production_scope(other, scope) is False
+
+    def test_production_files_and_dirs_combined(self, tmp_path):
+        root_file = tmp_path / "go.mod"
+        root_file.write_text("module example.com\n")
+        src = tmp_path / "src"
+        src.mkdir()
+        src_file = src / "main.go"
+        src_file.write_text("")
+        scope = ProductionScope(
+            production_dirs={src.resolve()},
+            production_files={root_file.resolve()},
+            method="test",
+        )
+        assert is_file_in_production_scope(root_file, scope) is True
+        assert is_file_in_production_scope(src_file, scope) is True
+        other = tmp_path / "tools" / "tool.go"
+        assert is_file_in_production_scope(other, scope) is False
 
 
 # ---------------------------------------------------------------------------
@@ -423,12 +96,12 @@ class TestIsYamlInProductionScope:
         assert is_yaml_in_production_scope(Path("deploy.yaml"), None) is None
 
     def test_no_manifest_files(self):
-        scope = ProductionScope(production_files=set(), method="test")
+        scope = ProductionScope(method="test")
         assert is_yaml_in_production_scope(Path("deploy.yaml"), scope) is None
 
     def test_non_yaml_file(self):
         scope = ProductionScope(
-            production_files=set(), method="test",
+            method="test",
             manifest_files=set(),
         )
         assert is_yaml_in_production_scope(Path("main.go"), scope) is None
@@ -437,7 +110,7 @@ class TestIsYamlInProductionScope:
         f = tmp_path / "deploy.yaml"
         f.write_text("")
         scope = ProductionScope(
-            production_files=set(), method="test",
+            method="test",
             manifest_files={f.resolve()},
         )
         assert is_yaml_in_production_scope(f, scope) is True
@@ -446,7 +119,7 @@ class TestIsYamlInProductionScope:
         f = tmp_path / "sample.yaml"
         f.write_text("")
         scope = ProductionScope(
-            production_files=set(), method="test",
+            method="test",
             manifest_files=set(),
         )
         assert is_yaml_in_production_scope(f, scope) is False
@@ -455,7 +128,7 @@ class TestIsYamlInProductionScope:
         f = tmp_path / "deploy.yml"
         f.write_text("")
         scope = ProductionScope(
-            production_files=set(), method="test",
+            method="test",
             manifest_files={f.resolve()},
         )
         assert is_yaml_in_production_scope(f, scope) is True
@@ -483,7 +156,7 @@ class TestCollectGoEmbeddedYamls:
             '//go:embed defaults.yaml\n'
             'var config []byte\n'
         )
-        result = _collect_go_embedded_yamls(tmp_path, {go_file.resolve()})
+        result = _collect_go_embedded_yamls(tmp_path, {go_file.parent.resolve()})
         assert yaml_file.resolve() in result
 
     def test_embed_subdirectory(self, tmp_path):
@@ -499,7 +172,7 @@ class TestCollectGoEmbeddedYamls:
             '//go:embed config/rules.yaml\n'
             'var rules string\n'
         )
-        result = _collect_go_embedded_yamls(tmp_path, {go_file.resolve()})
+        result = _collect_go_embedded_yamls(tmp_path, {go_file.parent.resolve()})
         assert yaml_file.resolve() in result
 
     def test_embed_glob_pattern(self, tmp_path):
@@ -516,7 +189,7 @@ class TestCollectGoEmbeddedYamls:
             '//go:embed templates/*\n'
             'var tpls embed.FS\n'
         )
-        result = _collect_go_embedded_yamls(tmp_path, {go_file.resolve()})
+        result = _collect_go_embedded_yamls(tmp_path, {go_file.parent.resolve()})
         assert (cfg / "a.yaml").resolve() in result
         assert (cfg / "b.yml").resolve() in result
         assert (cfg / "c.txt").resolve() not in result
@@ -532,7 +205,7 @@ class TestCollectGoEmbeddedYamls:
     def test_nonexistent_embed_target(self, tmp_path):
         go_file = tmp_path / "main.go"
         go_file.write_text('//go:embed missing.yaml\nvar d []byte\n')
-        result = _collect_go_embedded_yamls(tmp_path, {go_file.resolve()})
+        result = _collect_go_embedded_yamls(tmp_path, {go_file.parent.resolve()})
         assert result == set()
 
 
@@ -619,7 +292,7 @@ class TestCollectManifestScopeFiles:
 
 
 # ---------------------------------------------------------------------------
-# parse_component_manifest_mapping
+# parse_manifest_entries
 # ---------------------------------------------------------------------------
 
 class TestParseComponentManifestMapping:
@@ -632,7 +305,7 @@ class TestParseComponentManifestMapping:
             '    ["dashboard"]="opendatahub-io:odh-dashboard:main@def456:manifests"\n'
             ')\n'
         )
-        result = parse_component_manifest_mapping(str(tmp_path))
+        result, _ = parse_manifest_entries(str(tmp_path))
         assert result["kserve"] == ["config"]
         assert result["odh-dashboard"] == ["manifests"]
 
@@ -644,11 +317,12 @@ class TestParseComponentManifestMapping:
             '    ["cert-mgr"]="opendatahub-io:odh-gitops:main@abc:charts/deps/cert"\n'
             ')\n'
         )
-        result = parse_component_manifest_mapping(str(tmp_path))
+        result, _ = parse_manifest_entries(str(tmp_path))
         assert result["odh-gitops"] == ["charts/deps/cert"]
 
     def test_missing_script(self, tmp_path):
-        assert parse_component_manifest_mapping(str(tmp_path)) == {}
+        result, _ = parse_manifest_entries(str(tmp_path))
+        assert result == {}
 
     def test_merges_multiple_entries_for_same_repo(self, tmp_path):
         script = tmp_path / "get_all_manifests.sh"
@@ -659,7 +333,7 @@ class TestParseComponentManifestMapping:
             '    ["odh-ctrl"]="opendatahub-io:kubeflow:main@abc:components/odh/config"\n'
             ')\n'
         )
-        result = parse_component_manifest_mapping(str(tmp_path))
+        result, _ = parse_manifest_entries(str(tmp_path))
         assert sorted(result["kubeflow"]) == sorted([
             "components/nb/config",
             "components/odh/config",
@@ -687,30 +361,352 @@ class TestComputeProductionScopeWithManifests:
         scope = compute_production_scope(tmp_path)
         assert scope is None
 
-    def test_combined_go_and_manifest_scope(self, tmp_path):
-        (tmp_path / "go.mod").write_text("module example.com/repo\n")
-        pkg_dir = tmp_path / "cmd" / "mgr"
-        pkg_dir.mkdir(parents=True)
-        (pkg_dir / "main.go").write_text("package main\n")
 
+# ---------------------------------------------------------------------------
+# compute_production_scope with arch_data fixtures
+# ---------------------------------------------------------------------------
+
+class TestComputeProductionScopeWithArchData:
+    def test_go_operator_fixture(self, tmp_path):
+        from tests.conftest import load_arch_fixture
+
+        for d in ("cmd/manager", "pkg", "internal", "config"):
+            (tmp_path / d).mkdir(parents=True)
+        (tmp_path / "go.mod").write_text("module example.com\n")
+        (tmp_path / "go.sum").write_text("")
+        (tmp_path / "config" / "kustomization.yaml").write_text(
+            "resources:\n- base/deploy.yaml\n"
+        )
+        base = tmp_path / "config" / "base"
+        base.mkdir()
+        (base / "deploy.yaml").write_text("kind: Deployment")
+
+        arch_data = load_arch_fixture("go_operator")
+        scope = compute_production_scope(tmp_path, arch_data=arch_data)
+        assert scope is not None
+        assert scope.method == "arch-analyzer-original-sources"
+        assert scope.production_dirs is not None
+        assert (tmp_path / "cmd/manager").resolve() in scope.production_dirs
+        assert scope.manifest_files is not None
+        assert scope.manifest_source == "config"
+
+    def test_python_component_fixture(self, tmp_path):
+        from tests.conftest import load_arch_fixture
+
+        (tmp_path / "src").mkdir()
+        (tmp_path / "requirements.txt").write_text("flask==2.0\n")
+
+        arch_data = load_arch_fixture("python_component")
+        scope = compute_production_scope(tmp_path, arch_data=arch_data)
+        assert scope is not None
+        assert scope.method == "arch-analyzer-original-sources"
+        assert scope.production_dirs is not None
+        assert (tmp_path / "src").resolve() in scope.production_dirs
+
+    def test_multi_dockerfile_fixture(self, tmp_path):
+        from tests.conftest import load_arch_fixture
+
+        for d in ("cmd/server", "cmd/worker", "pkg", "config", "config/base"):
+            (tmp_path / d).mkdir(parents=True)
+        (tmp_path / "config" / "kustomization.yaml").write_text(
+            "resources:\n- base/deploy.yaml\n"
+        )
+        (tmp_path / "config" / "base" / "deploy.yaml").write_text("kind: Deployment")
+
+        arch_data = load_arch_fixture("multi_dockerfile")
+        scope = compute_production_scope(tmp_path, arch_data=arch_data)
+        assert scope is not None
+        assert (tmp_path / "cmd/server").resolve() in scope.production_dirs
+        assert (tmp_path / "cmd/worker").resolve() in scope.production_dirs
+        assert (tmp_path / "pkg").resolve() in scope.production_dirs
+
+
+# ---------------------------------------------------------------------------
+# _is_glob_source
+# ---------------------------------------------------------------------------
+
+class TestIsGlobSource:
+    def test_double_star(self):
+        assert _is_glob_source("cmd/**/main.go") is True
+
+    def test_docker_arg(self):
+        assert _is_glob_source("${APP_DIR}/main.go") is True
+
+    def test_literal_path(self):
+        assert _is_glob_source("cmd/main.go") is False
+
+    def test_single_star_not_glob(self):
+        assert _is_glob_source("cmd/*.go") is False
+
+
+# ---------------------------------------------------------------------------
+# _normalize_glob
+# ---------------------------------------------------------------------------
+
+class TestNormalizeGlob:
+    def test_full_component_becomes_doublestar(self):
+        assert _normalize_glob("${VAR}/main.go") == "**/main.go"
+
+    def test_mid_component_becomes_star(self):
+        assert _normalize_glob("file.${EXT}.txt") == "file.*.txt"
+
+    def test_no_vars_unchanged(self):
+        assert _normalize_glob("src/main.go") == "src/main.go"
+
+    def test_multiple_vars(self):
+        result = _normalize_glob("${A}/${B}/file.go")
+        assert result == "**/**/file.go"
+
+    def test_trailing_var(self):
+        assert _normalize_glob("src/${PKG}") == "src/**"
+
+
+# ---------------------------------------------------------------------------
+# _glob_source
+# ---------------------------------------------------------------------------
+
+class TestGlobSource:
+    def test_pure_doublestar_returns_empty(self, tmp_path):
+        assert _glob_source("**", tmp_path, tmp_path.resolve()) == []
+
+    def test_matches_dirs(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "main.go").write_text("")
+        results = _glob_source("src/**", tmp_path, tmp_path.resolve())
+        resolved = [r.resolve() for r in results]
+        assert src.resolve() in resolved or any(
+            r.resolve() == (src / "main.go").resolve() for r in results
+        )
+
+    def test_no_match_returns_empty(self, tmp_path):
+        assert _glob_source("nonexistent/**", tmp_path, tmp_path.resolve()) == []
+
+    def test_filters_root(self, tmp_path):
+        (tmp_path / "file.txt").write_text("")
+        results = _glob_source("*", tmp_path, tmp_path.resolve())
+        assert tmp_path.resolve() not in [r.resolve() for r in results]
+
+
+# ---------------------------------------------------------------------------
+# _find_go_module_dir
+# ---------------------------------------------------------------------------
+
+class TestFindGoModuleDir:
+    def test_finds_go_mod(self, tmp_path):
+        (tmp_path / "go.mod").write_text("module example.com\n")
+        result = _find_go_module_dir(["go.mod"], tmp_path)
+        assert result == tmp_path.resolve()
+
+    def test_finds_nested_go_mod(self, tmp_path):
+        cmd = tmp_path / "cmd"
+        cmd.mkdir()
+        (cmd / "go.mod").write_text("module example.com/cmd\n")
+        result = _find_go_module_dir(["cmd/go.mod"], tmp_path)
+        assert result == cmd.resolve()
+
+    def test_no_go_mod_returns_none(self, tmp_path):
+        result = _find_go_module_dir(["src/main.go"], tmp_path)
+        assert result is None
+
+    def test_skips_non_gomod_pattern(self, tmp_path):
+        (tmp_path / "go.sum").write_text("")
+        result = _find_go_module_dir(["go.sum"], tmp_path)
+        assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _nearest_package_json_dir
+# ---------------------------------------------------------------------------
+
+class TestNearestPackageJsonDir:
+    def test_in_current_dir(self, tmp_path):
+        app = tmp_path / "app"
+        app.mkdir()
+        (app / "package.json").write_text("{}")
+        result = _nearest_package_json_dir(app, tmp_path)
+        assert result == app.resolve()
+
+    def test_walks_up(self, tmp_path):
+        app = tmp_path / "app"
+        docker = app / "docker"
+        docker.mkdir(parents=True)
+        (app / "package.json").write_text("{}")
+        result = _nearest_package_json_dir(docker, tmp_path)
+        assert result == app.resolve()
+
+    def test_stops_at_repo_root(self, tmp_path):
+        deep = tmp_path / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        result = _nearest_package_json_dir(deep, tmp_path)
+        assert result == deep.resolve()
+
+
+# ---------------------------------------------------------------------------
+# _is_js_monorepo
+# ---------------------------------------------------------------------------
+
+class TestIsJsMonorepo:
+    def test_with_workspaces(self, tmp_path):
+        (tmp_path / "package.json").write_text(json.dumps({"workspaces": ["packages/*"]}))
+        assert _is_js_monorepo(tmp_path) is True
+
+    def test_without_workspaces(self, tmp_path):
+        (tmp_path / "package.json").write_text(json.dumps({"name": "app"}))
+        assert _is_js_monorepo(tmp_path) is False
+
+    def test_no_package_json(self, tmp_path):
+        assert _is_js_monorepo(tmp_path) is False
+
+    def test_invalid_json(self, tmp_path):
+        (tmp_path / "package.json").write_text("not json{{{")
+        assert _is_js_monorepo(tmp_path) is False
+
+
+# ---------------------------------------------------------------------------
+# _extract_production_sources_from_arch_data
+# ---------------------------------------------------------------------------
+
+class TestExtractProductionSources:
+    def test_empty_dockerfiles(self, tmp_path):
+        dirs, files, m_dirs, m_folders = _extract_production_sources_from_arch_data(
+            ArchAnalyzerResult.from_dict({"dockerfiles": []}), tmp_path
+        )
+        assert dirs == set()
+        assert files == set()
+        assert m_dirs == set()
+        assert m_folders == []
+
+    def test_literal_source_dir(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "Dockerfile",
+            "copy_instructions": [{"original_sources": ["src"]}],
+        }]})
+        dirs, _, _, _ = _extract_production_sources_from_arch_data(arch_data, tmp_path)
+        assert src.resolve() in dirs
+
+    def test_literal_source_file(self, tmp_path):
+        f = tmp_path / "go.mod"
+        f.write_text("module example.com\n")
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "Dockerfile",
+            "copy_instructions": [{"original_sources": ["go.mod"]}],
+        }]})
+        _, files, _, _ = _extract_production_sources_from_arch_data(arch_data, tmp_path)
+        assert f.resolve() in files
+
+    def test_manifest_hint_dir(self, tmp_path):
         cfg = tmp_path / "config"
         cfg.mkdir()
-        (cfg / "kustomization.yaml").write_text("resources:\n- deploy.yaml\n")
-        (cfg / "deploy.yaml").write_text("kind: Deployment")
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "Dockerfile",
+            "copy_instructions": [{
+                "original_sources": ["config"],
+                "manifest_hint": True,
+            }],
+        }]})
+        _, _, m_dirs, m_folders = _extract_production_sources_from_arch_data(arch_data, tmp_path)
+        assert cfg.resolve() in m_dirs
+        assert "config" in m_folders
 
-        go_list_output = json.dumps({
-            "Dir": str(pkg_dir),
-            "ImportPath": "example.com/repo/cmd/mgr",
-            "GoFiles": ["main.go"],
-        })
+    def test_entry_points_and_copy_sources_both_included(self, tmp_path):
+        """Entry points and COPY sources are both included in production scope."""
+        src = tmp_path / "src"
+        src.mkdir()
+        cmd = tmp_path / "cmd"
+        cmd.mkdir()
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "Dockerfile",
+            "build_commands": [{"entry_point": "cmd"}],
+            "copy_instructions": [{"original_sources": ["src"]}],
+        }]})
+        dirs, _, _, _ = _extract_production_sources_from_arch_data(arch_data, tmp_path)
+        assert cmd.resolve() in dirs
+        assert src.resolve() in dirs
 
-        with patch("rules.production_scope.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0, stdout=go_list_output)
-            scope = compute_production_scope(
-                tmp_path, manifest_source_folders=["config"],
-            )
+    def test_root_source_with_docker_context(self, tmp_path):
+        app = tmp_path / "app"
+        app.mkdir()
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "Dockerfile",
+            "copy_instructions": [{"original_sources": ["."]}],
+        }]})
+        dirs, _, _, _ = _extract_production_sources_from_arch_data(
+            arch_data, tmp_path, docker_contexts={"Dockerfile": "app"}
+        )
+        assert app.resolve() in dirs
 
-        assert scope is not None
-        assert scope.production_files
-        assert scope.manifest_files
-        assert scope.method == "go-import-graph"
+    def test_glob_source_with_var(self, tmp_path):
+        pkg = tmp_path / "pkg"
+        pkg.mkdir()
+        (pkg / "main.go").write_text("")
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "Dockerfile",
+            "copy_instructions": [{"original_sources": ["${APP}/main.go"]}],
+        }]})
+        dirs, files, _, _ = _extract_production_sources_from_arch_data(arch_data, tmp_path)
+        resolved_files = {f.resolve() for f in files}
+        resolved_dirs = {d.resolve() for d in dirs}
+        assert (pkg / "main.go").resolve() in resolved_files or pkg.resolve() in resolved_dirs
+
+    def test_direct_copy_uses_sources_fallback(self, tmp_path):
+        """Direct COPY (no from_stage) uses sources as original_sources."""
+        controller = tmp_path / "maas-controller"
+        controller.mkdir()
+        deploy = tmp_path / "maas-api" / "deploy"
+        deploy.mkdir(parents=True)
+        base_api = tmp_path / "deployment" / "base" / "maas-api"
+        base_api.mkdir(parents=True)
+
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "maas-controller/Dockerfile",
+            "copy_instructions": [
+                {
+                    "original_sources": ["maas-controller/"],
+                },
+                {"sources": ["maas-api/deploy"], "destination": "/maas-api/deploy"},
+                {"sources": ["deployment/base/maas-api"], "destination": "/deployment/base/maas-api"},
+            ],
+        }]})
+        dirs, _, _, _ = _extract_production_sources_from_arch_data(arch_data, tmp_path)
+        assert controller.resolve() in dirs
+        assert deploy.resolve() in dirs
+        assert base_api.resolve() in dirs
+
+    def test_root_source_scoped_via_dockerfile_dir_package_json(self, tmp_path):
+        """COPY . . in subdir Dockerfile — JS heuristic from Dockerfile dir."""
+        subdir = tmp_path / "frontend"
+        subdir.mkdir()
+        (subdir / "Dockerfile").write_text("FROM node\nCOPY . .\n")
+        (subdir / "package.json").write_text('{"name": "app"}')
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "frontend/Dockerfile",
+            "copy_instructions": [{"original_sources": ["."]}],
+        }]})
+        dirs, _, _, _ = _extract_production_sources_from_arch_data(arch_data, tmp_path)
+        assert subdir.resolve() in dirs
+
+    def test_root_source_subdir_dockerfile_no_heuristic_match(self, tmp_path):
+        """COPY . . in subdir Dockerfile, no go.mod/package.json — falls back to Dockerfile dir."""
+        subdir = tmp_path / "service"
+        subdir.mkdir()
+        (subdir / "Dockerfile").write_text("FROM ubuntu\nCOPY . .\n")
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "service/Dockerfile",
+            "copy_instructions": [{"original_sources": ["."]}],
+        }]})
+        dirs, _, _, _ = _extract_production_sources_from_arch_data(arch_data, tmp_path)
+        assert subdir.resolve() in dirs
+
+    def test_no_copy_instructions(self, tmp_path):
+        arch_data = ArchAnalyzerResult.from_dict({"dockerfiles": [{
+            "path": "Dockerfile",
+        }]})
+        dirs, files, _, _ = _extract_production_sources_from_arch_data(
+            arch_data, tmp_path
+        )
+        assert dirs == set()
+        assert files == set()
+

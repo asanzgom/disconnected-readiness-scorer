@@ -7,13 +7,15 @@ from typing import List
 
 try:
     from rules.common import (
-        Finding, RuleResult, get_tracked_files, is_in_production_scope,
-        is_yaml_in_production_scope, SKIP_DIRS, find_params_env_dirs,
+        Finding, RuleResult, get_tracked_files, is_file_in_production_scope,
+        SKIP_DIRS, find_params_env_dirs, build_overlay_file_map,
+        is_non_production_overlay_file, production_scope_relative_dirs,
     )
 except ModuleNotFoundError:
     from common import (
-        Finding, RuleResult, get_tracked_files, is_in_production_scope,
-        is_yaml_in_production_scope, SKIP_DIRS, find_params_env_dirs,
+        Finding, RuleResult, get_tracked_files, is_file_in_production_scope,
+        SKIP_DIRS, find_params_env_dirs, build_overlay_file_map,
+        is_non_production_overlay_file, production_scope_relative_dirs,
     )
 
 IMAGE_REF_PATTERN = re.compile(
@@ -29,6 +31,8 @@ K8S_UNQUALIFIED_IMAGE = re.compile(
 YAML_EXTENSIONS = {".yaml", ".yml"}
 
 SOURCE_EXTENSIONS = {".go", ".py", ".ts", ".tsx", ".sh"}
+
+_NAME_CONTAINS = ["Dockerfile"]
 
 _SKIP_FILENAMES = {
     "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
@@ -46,11 +50,20 @@ def is_source_code(filepath: Path) -> bool:
     return filepath.suffix in SOURCE_EXTENSIONS
 
 
+
 _MAX_FILE_SIZE = 512 * 1024  # 512 KB
 
 
-def scan_file(filepath: Path, root: Path, production_scope=None) -> List[Finding]:
+def scan_file(
+    filepath: Path,
+    root: Path,
+    production_scope=None,
+    overlay_file_map: dict[str, set[Path]] | None = None,
+    non_image_prefixes: list[str] | None = None,
+) -> List[Finding]:
     findings = []
+    if overlay_file_map is None:
+        overlay_file_map = {}
     try:
         file_size = filepath.stat().st_size
         if file_size > _MAX_FILE_SIZE:
@@ -65,9 +78,6 @@ def scan_file(filepath: Path, root: Path, production_scope=None) -> List[Finding
         lines = filepath.read_text().splitlines()
     except (OSError, UnicodeDecodeError):
         return findings
-
-    in_prod_go = is_in_production_scope(filepath, production_scope)
-    in_prod_yaml = is_yaml_in_production_scope(filepath, production_scope)
 
     is_yaml = filepath.suffix in YAML_EXTENSIONS or filepath.name == "params.env"
     found_on_line = set()
@@ -95,7 +105,8 @@ def scan_file(filepath: Path, root: Path, production_scope=None) -> List[Finding
                     continue
                 if ref_part.startswith("@sha256:"):
                     continue
-
+                if non_image_prefixes and any(repo_part.startswith(p) for p in non_image_prefixes):
+                    continue
             if is_oci:
                 if ref_part and ref_part.startswith("@sha256:"):
                     continue
@@ -126,9 +137,9 @@ def scan_file(filepath: Path, root: Path, production_scope=None) -> List[Finding
                     msg = f"{base_msg} Manifest file not managed by params.env."
 
             if severity in ("blocker", "warning"):
-                if in_prod_go is False or in_prod_yaml is False:
+                if is_non_production_overlay_file(filepath, production_scope, overlay_file_map):
                     severity = "info"
-                    msg += " [out of production scope]"
+                    msg += " [non-production overlay]"
 
             found_on_line.add(i)
             findings.append(Finding(
@@ -158,9 +169,9 @@ def scan_file(filepath: Path, root: Path, production_scope=None) -> List[Finding
                     msg = f"{base_msg} Manifest file not managed by params.env."
 
                 if severity == "blocker":
-                    if in_prod_go is False or in_prod_yaml is False:
+                    if is_non_production_overlay_file(filepath, production_scope, overlay_file_map):
                         severity = "info"
-                        msg += " [out of production scope]"
+                        msg += " [non-production overlay]"
 
                 findings.append(Finding(
                     severity=severity,
@@ -173,7 +184,7 @@ def scan_file(filepath: Path, root: Path, production_scope=None) -> List[Finding
     return findings
 
 
-def run(repo_root: str, production_scope=None) -> RuleResult:
+def run(repo_root: str, production_scope=None, arch_data=None, non_image_prefixes: list[str] | None = None, **_kwargs) -> RuleResult:
     root = Path(repo_root)
     result = RuleResult(rule="no-image-tags")
     skip_dirs = SKIP_DIRS
@@ -181,11 +192,30 @@ def run(repo_root: str, production_scope=None) -> RuleResult:
     params_env_dirs = find_params_env_dirs(root)
     params_env_prefixes = tuple(str(d) + "/" for d in params_env_dirs)
     tracked = get_tracked_files(root)
+    overlay_file_map = build_overlay_file_map(arch_data, root)
+
+    result.scan_filters = {
+        "globs": ["**/*"],
+        "extensions": sorted(extensions),
+        "name_contains": _NAME_CONTAINS,
+        "skip_dirs": sorted(skip_dirs),
+        "skip_filenames": sorted(_SKIP_FILENAMES),
+        "tracked_files_only": tracked is not None,
+    }
+    prod_dirs = production_scope_relative_dirs(production_scope, root)
+    if prod_dirs is not None:
+        result.scan_filters["production_scope_dirs"] = prod_dirs
+    if params_env_dirs:
+        result.scan_filters["params_env_dirs_excluded"] = sorted(
+            str(d.relative_to(root.resolve())) + "/"
+            for d in params_env_dirs
+            if d.is_relative_to(root.resolve())
+        )
 
     for filepath in root.rglob("*"):
         if filepath.name in _SKIP_FILENAMES:
             continue
-        if filepath.suffix not in extensions:
+        if filepath.suffix not in extensions and not any(s in filepath.name for s in _NAME_CONTAINS):
             continue
         if any(d in filepath.parts for d in skip_dirs):
             continue
@@ -194,8 +224,11 @@ def run(repo_root: str, production_scope=None) -> RuleResult:
             continue
         if params_env_prefixes and str(resolved).startswith(params_env_prefixes):
             continue
+        if is_file_in_production_scope(filepath, production_scope) is False:
+            continue
 
-        for finding in scan_file(filepath, root, production_scope=production_scope):
+        result.files_checked.append(str(filepath.relative_to(root)))
+        for finding in scan_file(filepath, root, production_scope=production_scope, overlay_file_map=overlay_file_map, non_image_prefixes=non_image_prefixes):
             result.findings.append(finding)
             if finding.severity == "blocker":
                 result.passed = False

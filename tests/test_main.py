@@ -3,15 +3,19 @@
 import json
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from main import (
+    ArchAnalyzerError,
     _build_exception_snippets,
     _build_false_positive_section,
     _get_repo_name,
     _render_template_simple,
+    _run_arch_analyzer,
+    _validate_config_schema,
     adapt_manifest_result,
     apply_exceptions,
     compute_score,
@@ -29,6 +33,25 @@ from rules.common import Finding, RuleResult
 def load_exceptions(path):
     """Test helper: load exceptions list from a config file."""
     return load_central_config(path)["exceptions"]
+
+
+def _make_import_side_effect(fake_mod):
+    """Return an importlib.import_module side_effect that is module-aware.
+
+    Returns *fake_mod* for rule modules but a proper mock with
+    parse_manifest_entries / parse_overlay_paths_from_arch_data for
+    ``rules.operator_manifest`` so production-scope code works.
+    """
+    op_manifest_mock = MagicMock()
+    op_manifest_mock.parse_manifest_entries.return_value = ({}, {})
+    op_manifest_mock.parse_overlay_paths_from_arch_data.return_value = []
+
+    def _side_effect(name):
+        if name == "rules.operator_manifest":
+            return op_manifest_mock
+        return fake_mod
+
+    return _side_effect
 
 
 # --- parse_args ---
@@ -60,7 +83,12 @@ class TestParseArgs:
 
     def test_output_short(self):
         args = parse_args([".", "-o", "out.md"])
-        assert args.output == "out.md"
+        assert args.output == ["out.md"]
+
+    def test_output_dual(self):
+        args = parse_args([".", "--report", "json,markdown", "-o", "r.json", "r.md"])
+        assert args.report == "json,markdown"
+        assert args.output == ["r.json", "r.md"]
 
 
 # --- resolve_rules ---
@@ -223,6 +251,25 @@ class TestRenderJson:
         assert data["rules"] == []
         assert data["score"] == "READY"
 
+    def test_verbose_includes_files_checked(self):
+        r = RuleResult(rule="b", passed=True)
+        r.files_checked = ["src/a.go", "src/b.go", "src/a.go"]
+        data = json.loads(render_json("READY", [r], "repo", verbose=True))
+        rule = data["rules"][0]
+        assert "files_checked" in rule
+        assert rule["files_checked"] == ["src/a.go", "src/b.go"]  # sorted+deduped
+
+    def test_non_verbose_omits_files_checked(self):
+        r = RuleResult(rule="b", passed=True)
+        r.files_checked = ["src/a.go"]
+        data = json.loads(render_json("READY", [r], "repo", verbose=False))
+        assert "files_checked" not in data["rules"][0]
+
+    def test_verbose_omits_files_checked_when_empty(self):
+        r = RuleResult(rule="c", passed=True)
+        data = json.loads(render_json("READY", [r], "repo", verbose=True))
+        assert "files_checked" not in data["rules"][0]
+
 
 # --- _render_template_simple ---
 
@@ -281,40 +328,40 @@ class TestRenderMarkdown:
 
 class TestMain:
     @patch("main.compute_production_scope", return_value=None)
-    @patch("main.importlib.import_module")
-    def test_all_pass_returns_0(self, mock_import, _mock_scope):
+    def test_all_pass_returns_0(self, _mock_scope):
         fake_mod = MagicMock()
         fake_mod.run.return_value = RuleResult(rule="test-rule", passed=True)
         fake_mod.detect_image_pattern.return_value = "static_csv"
-        mock_import.return_value = fake_mod
 
-        exit_code = main([".", "--rules", "csv,tags,egress,python", "--report", "json"])
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("importlib.import_module", side_effect=_make_import_side_effect(fake_mod)):
+            exit_code = main([".", "--rules", "csv,tags,egress,python", "--report", "json"])
         assert exit_code == 0
 
     @patch("main.compute_production_scope", return_value=None)
-    @patch("main.importlib.import_module")
-    def test_blocker_returns_1(self, mock_import, _mock_scope):
+    def test_blocker_returns_1(self, _mock_scope):
         fake_mod = MagicMock()
         fake_mod.run.return_value = RuleResult(
             rule="test-rule", passed=False,
             findings=[Finding("blocker", "f.go", 1, "img", "fail")],
         )
         fake_mod.detect_image_pattern.return_value = "static_csv"
-        mock_import.return_value = fake_mod
 
-        exit_code = main([".", "--rules", "csv", "--report", "json"])
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("importlib.import_module", side_effect=_make_import_side_effect(fake_mod)):
+            exit_code = main([".", "--rules", "csv", "--report", "json"])
         assert exit_code == 1
 
     @patch("main.compute_production_scope", return_value=None)
-    @patch("main.importlib.import_module")
-    def test_output_flag_writes_file(self, mock_import, _mock_scope, tmp_path):
+    def test_output_flag_writes_file(self, _mock_scope, tmp_path):
         fake_mod = MagicMock()
         fake_mod.run.return_value = RuleResult(rule="r", passed=True)
         fake_mod.detect_image_pattern.return_value = "static_csv"
-        mock_import.return_value = fake_mod
 
         out_file = tmp_path / "report.json"
-        exit_code = main([".", "--rules", "csv", "--report", "json", "-o", str(out_file)])
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("importlib.import_module", side_effect=_make_import_side_effect(fake_mod)):
+            exit_code = main([".", "--rules", "csv", "--report", "json", "-o", str(out_file)])
         assert exit_code == 0
         content = out_file.read_text()
         data = json.loads(content.strip())
@@ -323,11 +370,12 @@ class TestMain:
     @patch("main.compute_production_scope", return_value=None)
     def test_manifest_rule_triggers_adapt(self, _mock_scope):
         fake_manifest = FakeManifest(images=[], components=[], known_issues=[])
+        fake_mod = MagicMock()
 
-        with patch("main.load_manifest", return_value=(fake_manifest, set())) as mock_load, \
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("main.load_manifest", return_value=(fake_manifest, set())) as mock_load, \
              patch("main.adapt_manifest_result", return_value=RuleResult(rule="operator-manifest")) as mock_adapt, \
-             patch("importlib.import_module") as mock_import:
-            mock_import.return_value = MagicMock()
+             patch("importlib.import_module", side_effect=_make_import_side_effect(fake_mod)):
             exit_code = main([".", "--rules", "manifest", "--report", "json"])
             assert exit_code == 0
             mock_load.assert_called_once()
@@ -341,12 +389,53 @@ class TestMain:
 
         fake_manifest = FakeManifest(images=[], components=[], known_issues=[])
 
-        with patch("main.load_manifest", return_value=(fake_manifest, set())) as mock_load, \
-             patch("importlib.import_module", return_value=fake_mod):
+        with patch("main._run_arch_analyzer", return_value=None), \
+             patch("main.load_manifest", return_value=(fake_manifest, set())) as mock_load, \
+             patch("importlib.import_module", side_effect=_make_import_side_effect(fake_mod)):
             exit_code = main([".", "--rules", "csv", "--report", "json"])
             assert exit_code == 0
             mock_load.assert_called_once()
 
+
+
+# --- integration tests with arch-analyzer fixtures ---
+
+class TestMainWithArchFixtures:
+    """Integration tests that pass real arch-analyzer fixture data through the pipeline."""
+
+    @patch("main.compute_production_scope", return_value=None)
+    def test_arch_data_passed_to_rules(self, _mock_scope):
+        from tests.conftest import load_arch_fixture
+
+        fixture = load_arch_fixture("go_operator")
+        fake_mod = MagicMock()
+        fake_mod.run.return_value = RuleResult(rule="test-rule", passed=True)
+        fake_mod.detect_image_pattern.return_value = "static_csv"
+
+        with patch("main._run_arch_analyzer", return_value=fixture), \
+             patch("importlib.import_module", side_effect=_make_import_side_effect(fake_mod)):
+            exit_code = main([".", "--rules", "tags", "--report", "json"])
+
+        assert exit_code == 0
+        call_kwargs = fake_mod.run.call_args
+        assert call_kwargs[1].get("arch_data") is fixture
+
+    @patch("main.compute_production_scope")
+    def test_arch_data_passed_to_production_scope(self, mock_scope):
+        from tests.conftest import load_arch_fixture
+
+        mock_scope.return_value = None
+        fixture = load_arch_fixture("python_component")
+        fake_mod = MagicMock()
+        fake_mod.run.return_value = RuleResult(rule="test-rule", passed=True)
+        fake_mod.detect_image_pattern.return_value = "static_csv"
+
+        with patch("main._run_arch_analyzer", return_value=fixture), \
+             patch("importlib.import_module", side_effect=_make_import_side_effect(fake_mod)):
+            main([".", "--rules", "tags", "--report", "json"])
+
+        scope_call = mock_scope.call_args
+        assert scope_call[1].get("arch_data") is fixture
 
 
 # --- load_exceptions ---
@@ -357,7 +446,8 @@ class TestLoadExceptions:
         exc_file.write_text(
             "exceptions:\n"
             "  - rule: no-runtime-egress\n"
-            '    path: "src/main.go"\n'
+            "    paths:\n"
+            '      - "src/main.go"\n'
             '    reason: "internal proxy"\n'
         )
         result = load_exceptions(str(exc_file))
@@ -383,25 +473,27 @@ class TestLoadExceptions:
         exc_file.write_text(
             "exceptions:\n"
             "  - rule: no-image-tags\n"
-            '    path: "deploy.yaml"\n'
+            "    paths:\n"
+            '      - "deploy.yaml"\n'
         )
-        with pytest.raises(ValueError, match="missing required 'reason' field"):
+        with pytest.raises(ValueError, match="reason"):
             load_exceptions(str(exc_file))
 
     def test_missing_rule_raises(self, tmp_path):
         exc_file = tmp_path / "exceptions.yaml"
         exc_file.write_text(
             "exceptions:\n"
-            '  - path: "deploy.yaml"\n'
+            "  - paths:\n"
+            '      - "deploy.yaml"\n'
             '    reason: "test"\n'
         )
-        with pytest.raises(ValueError, match="missing required 'rule' field"):
+        with pytest.raises(ValueError, match="rule"):
             load_exceptions(str(exc_file))
 
     def test_non_dict_entry_raises(self, tmp_path):
         exc_file = tmp_path / "exceptions.yaml"
         exc_file.write_text("exceptions:\n  - no-image-tags\n")
-        with pytest.raises(ValueError, match="must be a mapping"):
+        with pytest.raises(ValueError):
             load_exceptions(str(exc_file))
 
     def test_malformed_yaml_raises(self, tmp_path):
@@ -421,13 +513,14 @@ class TestLoadExceptions:
         exc_file.write_text(
             "exceptions:\n"
             "  - rule: no-image-tags, no-runtime-egress\n"
-            '    path: "install/*"\n'
+            "    paths:\n"
+            '      - "install/*"\n'
             '    reason: "historical snapshots"\n'
         )
         result = load_exceptions(str(exc_file))
         assert len(result) == 1
         assert result[0]["rule"] == "no-image-tags, no-runtime-egress"
-        assert result[0]["path"] == "install/*"
+        assert result[0]["paths"] == ["install/*"]
 
 
 
@@ -501,7 +594,7 @@ class TestApplyExceptions:
                 Finding("blocker", "deploy/app.yaml", 2, "img2", "also bad"),
             ],
         )]
-        exceptions = [{"rule": "no-image-tags", "path": "src/*.go", "reason": "source ok"}]
+        exceptions = [{"rule": "no-image-tags", "paths": ["src/*.go"], "reason": "source ok"}]
         apply_exceptions(results, exceptions, "repo")
         assert results[0].findings[0].severity == "info"
         assert results[0].findings[1].severity == "blocker"
@@ -567,8 +660,8 @@ class TestApplyExceptions:
             ],
         )]
         exceptions = [
-            {"rule": "r", "path": "a.go", "reason": "ok"},
-            {"rule": "r", "path": "b.go", "reason": "ok"},
+            {"rule": "r", "paths": ["a.go"], "reason": "ok"},
+            {"rule": "r", "paths": ["b.go"], "reason": "ok"},
         ]
         apply_exceptions(results, exceptions, "repo")
         assert results[0].passed is True
@@ -595,7 +688,7 @@ class TestApplyExceptions:
         ]
         exceptions = [{
             "rule": "no-image-tags, no-runtime-egress",
-            "path": "install/*",
+            "paths": ["install/*"],
             "reason": "historical snapshots",
         }]
         apply_exceptions(results, exceptions, "repo")
@@ -619,6 +712,43 @@ class TestApplyExceptions:
             findings=[Finding("blocker", "f.go", 1, "", "http.Get with hardcoded external URL")],
         )]
         exceptions = [{"rule": "r", "message": "http", "reason": "ok"}]
+        apply_exceptions(results, exceptions, "repo")
+        assert results[0].findings[0].severity == "blocker"
+
+    def test_images_list_matches(self):
+        results = [RuleResult(
+            rule="r", passed=False,
+            findings=[Finding("blocker", "f.yaml", 1, "repo/REPLACE_IMAGE:tag", "tagged image")],
+        )]
+        exceptions = [{"rule": "*", "images": ["*/REPLACE_IMAGE:*"], "reason": "placeholder"}]
+        apply_exceptions(results, exceptions, "repo")
+        assert results[0].findings[0].severity == "info"
+        assert results[0].passed is True
+
+    def test_images_list_no_match_stays_blocker(self):
+        results = [RuleResult(
+            rule="r", passed=False,
+            findings=[Finding("blocker", "f.yaml", 1, "quay.io/org/real:tag", "tagged image")],
+        )]
+        exceptions = [{"rule": "*", "images": ["*/REPLACE_IMAGE:*"], "reason": "placeholder"}]
+        apply_exceptions(results, exceptions, "repo")
+        assert results[0].findings[0].severity == "blocker"
+
+    def test_images_list_any_pattern_matches(self):
+        results = [RuleResult(
+            rule="r", passed=False,
+            findings=[Finding("blocker", "f.yaml", 1, "quay.io/org/app:replace", "tagged image")],
+        )]
+        exceptions = [{"rule": "*", "images": ["*/REPLACE_IMAGE:*", "*:replace"], "reason": "placeholder"}]
+        apply_exceptions(results, exceptions, "repo")
+        assert results[0].findings[0].severity == "info"
+
+    def test_images_and_paths_both_must_match(self):
+        results = [RuleResult(
+            rule="r", passed=False,
+            findings=[Finding("blocker", "prod/f.yaml", 1, "repo/REPLACE_IMAGE:tag", "tagged")],
+        )]
+        exceptions = [{"rule": "*", "images": ["*/REPLACE_IMAGE:*"], "paths": ["test/**"], "reason": "placeholder"}]
         apply_exceptions(results, exceptions, "repo")
         assert results[0].findings[0].severity == "blocker"
 
@@ -678,6 +808,157 @@ class TestParseArgsExceptions:
 # --- central exception loading ---
 
 
+class TestLoadCentralConfig:
+    def test_missing_file_returns_defaults(self, tmp_path):
+        from main import load_central_config
+        cfg = load_central_config(str(tmp_path / "nope.yaml"))
+        assert cfg["exceptions"] == []
+
+    def test_present_file_has_all_keys(self, tmp_path):
+        from main import load_central_config
+        f = tmp_path / "config.yaml"
+        f.write_text("exceptions: []\n")
+        cfg = load_central_config(str(f))
+        assert cfg["docker_contexts"] == {}
+        assert cfg["known_non_image_prefixes"] == []
+        assert cfg["params_env_filenames"] == {}
+
+    def test_loads_docker_contexts(self, tmp_path):
+        from main import load_central_config
+        f = tmp_path / "config.yaml"
+        f.write_text(
+            "docker_contexts:\n"
+            "  myrepo:\n"
+            "    Dockerfile: src/\n"
+        )
+        cfg = load_central_config(str(f))
+        assert cfg["docker_contexts"] == {"myrepo": {"Dockerfile": "src/"}}
+
+    def test_loads_known_non_image_prefixes(self, tmp_path):
+        from main import load_central_config
+        f = tmp_path / "config.yaml"
+        f.write_text("known_non_image_prefixes:\n  - ghcr.io/foo/bar\n")
+        cfg = load_central_config(str(f))
+        assert "ghcr.io/foo/bar" in cfg["known_non_image_prefixes"]
+
+    def test_loads_params_env_filenames(self, tmp_path):
+        from main import load_central_config
+        f = tmp_path / "config.yaml"
+        f.write_text(
+            "params_env_filenames:\n"
+            "  myrepo:\n"
+            "    - params-latest.env\n"
+        )
+        cfg = load_central_config(str(f))
+        assert cfg["params_env_filenames"] == {"myrepo": ["params-latest.env"]}
+
+
+class TestArchAnalyzerError:
+    def test_is_exception(self):
+        from main import ArchAnalyzerError
+        err = ArchAnalyzerError("binary missing")
+        assert isinstance(err, Exception)
+        assert "binary missing" in str(err)
+
+
+class TestValidateConfigSchema:
+    def test_valid_config_passes(self):
+        _validate_config_schema({"exceptions": []}, "test.yaml")
+
+    def test_invalid_config_raises(self):
+        with pytest.raises(ValueError, match="schema validation error"):
+            _validate_config_schema({"exceptions": "not_a_list"}, "test.yaml")
+
+    def test_missing_schema_file_no_error(self, monkeypatch):
+        import main
+        monkeypatch.setattr(main, "_SCHEMA_PATH", Path("/nonexistent/schema.json"))
+        _validate_config_schema({"anything": True}, "test.yaml")
+
+
+class TestRunArchAnalyzer:
+    def test_deletes_existing_json_before_run(self, tmp_path, monkeypatch):
+        """Pre-existing JSON is deleted (supply chain safety), binary must exist."""
+        (tmp_path / "component-architecture.json").write_text('{"old": true}')
+        with pytest.raises(ArchAnalyzerError, match="not found"):
+            _run_arch_analyzer("nonexistent-bin", str(tmp_path))
+        assert not (tmp_path / "component-architecture.json").exists()
+
+    def test_binary_not_found_raises(self, tmp_path):
+        with pytest.raises(ArchAnalyzerError, match="not found"):
+            _run_arch_analyzer(str(tmp_path / "no-such-bin"), str(tmp_path))
+
+    def test_subprocess_failure_raises(self, tmp_path, monkeypatch):
+        import subprocess
+        bin_path = tmp_path / "fake-bin"
+        bin_path.touch()
+        monkeypatch.setattr(
+            "main.subprocess.run",
+            MagicMock(side_effect=subprocess.CalledProcessError(1, "cmd", stderr=b"fail")),
+        )
+        with pytest.raises(ArchAnalyzerError, match="failed"):
+            _run_arch_analyzer(str(bin_path), str(tmp_path))
+
+    def test_timeout_raises(self, tmp_path, monkeypatch):
+        import subprocess
+        bin_path = tmp_path / "fake-bin"
+        bin_path.touch()
+        monkeypatch.setattr(
+            "main.subprocess.run",
+            MagicMock(side_effect=subprocess.TimeoutExpired("cmd", 300)),
+        )
+        with pytest.raises(ArchAnalyzerError, match="failed"):
+            _run_arch_analyzer(str(bin_path), str(tmp_path))
+
+    def test_missing_output_after_run_raises(self, tmp_path, monkeypatch):
+        bin_path = tmp_path / "fake-bin"
+        bin_path.touch()
+        monkeypatch.setattr("main.subprocess.run", MagicMock())
+        with pytest.raises(ArchAnalyzerError, match="did not generate"):
+            _run_arch_analyzer(str(bin_path), str(tmp_path))
+
+    def test_invalid_json_raises(self, tmp_path, monkeypatch):
+        bin_path = tmp_path / "fake-bin"
+        bin_path.touch()
+
+        def fake_run(*args, **kwargs):
+            (tmp_path / "component-architecture.json").write_text("not json{{{")
+
+        monkeypatch.setattr("main.subprocess.run", fake_run)
+        with pytest.raises(ArchAnalyzerError, match="Failed to parse"):
+            _run_arch_analyzer(str(bin_path), str(tmp_path))
+
+
+class TestApplyExceptionsHits:
+    def test_returns_hit_counts(self):
+        results = [RuleResult(
+            rule="r", passed=False,
+            findings=[Finding("blocker", "f.go", 1, "", "msg")],
+        )]
+        exceptions = [
+            {"rule": "r", "reason": "ok"},
+            {"rule": "other", "reason": "unused"},
+        ]
+        hits = apply_exceptions(results, exceptions, "repo")
+        assert hits == [1, 0]
+
+    def test_empty_exceptions_returns_empty(self):
+        results = [RuleResult(rule="r", findings=[Finding("blocker", "f", 1, "", "m")])]
+        hits = apply_exceptions(results, [], "repo")
+        assert hits == []
+
+    def test_wildcard_rule_counts(self):
+        results = [RuleResult(
+            rule="r", passed=False,
+            findings=[
+                Finding("blocker", "a.go", 1, "", "m1"),
+                Finding("blocker", "b.go", 2, "", "m2"),
+                Finding("blocker", "c.go", 3, "", "m3"),
+            ],
+        )]
+        exceptions = [{"rule": "*", "reason": "all ok"}]
+        hits = apply_exceptions(results, exceptions, "repo")
+        assert hits == [3]
+
 
 # --- exception snippets and false positive section ---
 
@@ -685,7 +966,7 @@ class TestExceptionSnippets:
     def test_builds_snippets_from_blockers_only(self):
         results = [RuleResult(rule="no-image-tags", findings=[
             Finding("blocker", "deploy.yaml", 10, "img:latest", "mutable tag"),
-            Finding("warning", "src/main.go", 5, "img:v1", "source tag"),
+            Finding("info", "src/main.go", 5, "img:v1", "source tag"),
             Finding("info", "test/t.go", 1, "img:dev", "test file"),
         ])]
         snippets = _build_exception_snippets(results)

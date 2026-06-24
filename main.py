@@ -2,7 +2,7 @@
 """Disconnected Readiness Scorer — orchestrator.
 
 Runs all (or selected) rules against a target repo and produces
-an aggregate READY / WARNING / NOT READY score.
+an aggregate READY / NOT READY score.
 """
 
 import argparse
@@ -18,14 +18,19 @@ from datetime import date
 from fnmatch import fnmatch
 from pathlib import Path
 
+import jsonschema
 import yaml
 
-from rules.common import (
-    Finding, RuleResult,
-)
+from rules.common import ArchAnalyzerResult, Finding, RuleResult
 from rules.production_scope import compute_production_scope
 
 SEVERITY_ORDER = {"blocker": 0, "info": 1}
+
+
+class ArchAnalyzerError(Exception):
+    """Raised when arch-analyzer binary is missing or fails."""
+
+
 CENTRAL_CONFIG_PATH = "config/config.yaml"
 
 RULE_REGISTRY = {
@@ -77,24 +82,40 @@ def _load_yaml_file(config_path):
         ) from exc
 
 
-def load_central_config(config_path):
-    """Load unified central config (config/config.yaml).
+_SCHEMA_PATH = Path(__file__).parent / "schemas" / "config.schema.json"
 
-    Returns dict with keys: registries, known_mirrors, exceptions.
-    """
+
+def _validate_config_schema(raw, config_path):
+    """Validate config dict against schemas/config.schema.json."""
+    try:
+        schema = json.loads(_SCHEMA_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        print(f"WARNING: schema validation disabled ({_SCHEMA_PATH} unreadable)", file=sys.stderr)
+        return
+    try:
+        jsonschema.validate(raw, schema)
+    except jsonschema.ValidationError as exc:
+        raise ValueError(
+            f"{config_path}: schema validation error: {exc.message}"
+        ) from exc
+
+
+def load_central_config(config_path):
     raw = _load_yaml_file(config_path)
     if raw is None:
-        return {"registries": [], "known_mirrors": {}, "exceptions": []}
+        return {"exceptions": []}
     if not isinstance(raw, dict):
         raise ValueError(
             f"{config_path} must be a YAML mapping, got {type(raw).__name__}"
         )
+    _validate_config_schema(raw, config_path)
     exceptions = raw.get("exceptions") or []
     _validate_exceptions(exceptions, config_path)
     return {
-        "registries": raw.get("registries") or [],
-        "known_mirrors": raw.get("known_mirrors") or {},
         "exceptions": exceptions,
+        "docker_contexts": raw.get("docker_contexts") or {},
+        "known_non_image_prefixes": raw.get("known_non_image_prefixes") or [],
+        "params_env_filenames": raw.get("params_env_filenames") or {},
     }
 
 
@@ -143,12 +164,16 @@ def _path_matches(filepath: str, pattern: str) -> bool:
 
 
 def apply_exceptions(results, exceptions, repo_name):
-    """Downgrade blocker findings that match configured exceptions to info severity."""
+    """Downgrade blocker findings that match configured exceptions to info severity.
+
+    Returns a list of hit counts, one per exception entry (parallel to exceptions list).
+    """
+    hits = [0] * len(exceptions)
     for result in results:
         for finding in result.findings:
             if finding.severity != "blocker":
                 continue
-            for exc in exceptions:
+            for i, exc in enumerate(exceptions):
                 exc_rule = exc.get("rule", "")
                 if exc_rule != "*":
                     exc_rules = [r.strip() for r in exc_rule.split(",")]
@@ -163,15 +188,12 @@ def apply_exceptions(results, exceptions, repo_name):
                         if exc_repo != repo_name.rsplit("/", 1)[-1]:
                             continue
                 exc_paths = exc.get("paths") or []
-                exc_path = exc.get("path")
-                if exc_path:
-                    exc_paths = exc_paths + [exc_path]
                 if exc_paths:
                     if not any(_path_matches(finding.file, p) for p in exc_paths):
                         continue
-                exc_image = exc.get("image")
-                if exc_image:
-                    if not fnmatch(finding.image, exc_image):
+                exc_images = exc.get("images") or []
+                if exc_images:
+                    if not any(fnmatch(finding.image, pat) for pat in exc_images):
                         continue
                 exc_message = exc.get("message")
                 if exc_message:
@@ -180,10 +202,11 @@ def apply_exceptions(results, exceptions, repo_name):
                 reason = exc.get("reason", "configured exception")
                 finding.message += f" [Exception: {reason}]"
                 finding.severity = "info"
+                hits[i] += 1
                 break
         if not any(f.severity == "blocker" for f in result.findings):
             result.passed = True
-
+    return hits
 
 
 
@@ -202,8 +225,9 @@ def parse_args(argv=None):
              f"Available: {', '.join(RULE_REGISTRY)}",
     )
     parser.add_argument(
-        "--report", choices=["markdown", "json"], default="markdown",
-        help="Output format (default: markdown)",
+        "--report", default="markdown",
+        help="Output format: 'markdown', 'json', or comma-separated "
+             "'json,markdown' for dual output (default: markdown).",
     )
     parser.add_argument(
         "--operator-path",
@@ -211,8 +235,9 @@ def parse_args(argv=None):
              "If omitted, clones to a temporary directory when needed.",
     )
     parser.add_argument(
-        "--output", "-o",
-        help="Write the report to a file instead of stdout.",
+        "--output", "-o", nargs="*",
+        help="Write report(s) to file(s). With dual --report, provide "
+             "one -o per format in the same order.",
     )
     parser.add_argument(
         "--config",
@@ -224,8 +249,15 @@ def parse_args(argv=None):
              "All files are scanned at full severity.",
     )
     parser.add_argument(
-        "--timing", action="store_true",
-        help="Print per-step wall time to stderr for performance debugging.",
+        "--verbose", "-v", action="store_true",
+        help="Print detailed diagnostic output to stderr (per-step timing, "
+             "file scan progress, production scope decisions, config loading). "
+             "When used with --report json, includes files_checked per rule.",
+    )
+    parser.add_argument(
+        "--arch-analyzer",
+        default=str(Path(__file__).parent / "bin" / "arch-analyzer"),
+        help="Path to arch-analyzer binary (default: bin/arch-analyzer).",
     )
     return parser.parse_args(argv)
 
@@ -292,8 +324,9 @@ def compute_score(results):
     return "READY"
 
 
-def print_summary(score, results):
-    print(f"\nDisconnected Readiness Score: {score}\n", file=sys.stderr)
+def print_summary(score, results, log_file=None):
+    out = log_file or sys.stderr
+    print(f"\nDisconnected Readiness Score: {score}\n", file=out)
     for r in results:
         blockers = sum(1 for f in r.findings if f.severity == "blocker")
 
@@ -304,35 +337,50 @@ def print_summary(score, results):
             tag = "PASS"
             summary_msg = "All checks passed"
 
-        print(f"  {tag:<9} {r.rule:<25} {summary_msg}", file=sys.stderr)
+        print(f"  {tag:<9} {r.rule:<25} {summary_msg}", file=out)
 
     total_blockers = sum(1 for r in results for f in r.findings if f.severity == "blocker")
     total_passed = sum(1 for r in results if r.passed)
-    print(f"\nBlockers: {total_blockers} | Passed: {total_passed}", file=sys.stderr)
+    print(f"\nBlockers: {total_blockers} | Passed: {total_passed}", file=out)
 
 
-def render_json(score, results, repo_name):
+def render_json(score, results, repo_name, verbose=False, exceptions=None, exception_hits=None):
     snippets = _build_exception_snippets(results)
+    rules_data = []
+    for r in results:
+        rule_entry = {
+            "name": r.rule,
+            "passed": r.passed,
+            "blockers": sum(1 for f in r.findings if f.severity == "blocker"),
+            "infos": sum(1 for f in r.findings if f.severity == "info"),
+            "findings": [
+                {"severity": f.severity, "file": f.file, "line": f.line,
+                 "image": f.image, "message": f.message}
+                for f in sorted(r.findings,
+                                key=lambda f: SEVERITY_ORDER.get(f.severity, 99))
+            ],
+        }
+        if verbose and r.files_checked:
+            rule_entry["files_checked"] = sorted(set(r.files_checked))
+            if r.scan_filters:
+                rule_entry["scan_filters"] = r.scan_filters
+        rules_data.append(rule_entry)
     data = {
         "repo": repo_name,
         "date": date.today().isoformat(),
         "score": score,
-        "rules": [
-            {
-                "name": r.rule,
-                "passed": r.passed,
-                "blockers": sum(1 for f in r.findings if f.severity == "blocker"),
-                "infos": sum(1 for f in r.findings if f.severity == "info"),
-                "findings": [
-                    {"severity": f.severity, "file": f.file, "line": f.line,
-                     "image": f.image, "message": f.message}
-                    for f in sorted(r.findings,
-                                    key=lambda f: SEVERITY_ORDER.get(f.severity, 99))
-                ],
-            }
-            for r in results
-        ],
+        "rules": rules_data,
     }
+    if exceptions and exception_hits:
+        data["exceptions"] = [
+            {
+                "rule": exc.get("rule", ""),
+                "reason": exc.get("reason", ""),
+                **({"repo": exc["repo"]} if exc.get("repo") else {}),
+                "hits": exception_hits[i],
+            }
+            for i, exc in enumerate(exceptions)
+        ]
     if snippets:
         data["false_positive_help"] = {
             "exception_snippets": snippets,
@@ -441,7 +489,33 @@ def _build_false_positive_section(snippets):
     return "\n".join(lines)
 
 
-def render_markdown(score, results, repo_name):
+def _build_exceptions_section(exceptions, exception_hits):
+    """Build the Applied Exceptions markdown section."""
+    if not exceptions or not exception_hits:
+        return ""
+    applied = [
+        (exc, exception_hits[i])
+        for i, exc in enumerate(exceptions)
+        if exception_hits[i] > 0
+    ]
+    if not applied:
+        return ""
+    lines = [
+        "## Applied Exceptions",
+        "",
+        "| Rule | Repo | Reason | Hits |",
+        "|------|------|--------|------|",
+    ]
+    for exc, hits in applied:
+        rule = _escape_md_cell(exc.get("rule", ""))
+        repo = _escape_md_cell(exc.get("repo", ""))
+        reason = _escape_md_cell(exc.get("reason", ""))
+        lines.append(f"| {rule} | {repo} | {reason} | {hits} |")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def render_markdown(score, results, repo_name, exceptions=None, exception_hits=None):
     template_path = Path(__file__).parent / "templates" / "report.md"
     try:
         template_str = template_path.read_text()
@@ -472,6 +546,7 @@ def render_markdown(score, results, repo_name):
             for r in results
         ],
         "blockers": blocker_rows,
+        "exceptions_section": _build_exceptions_section(exceptions, exception_hits),
         "false_positive_section": _build_false_positive_section(
             _build_exception_snippets(results)
         ),
@@ -507,8 +582,8 @@ def _get_repo_name(repo_root):
     return os.path.basename(repo_root)
 
 
-def _load_central_exceptions(args):
-    """Load central exceptions.
+def _load_all_exceptions(args):
+    """Load exceptions from central config.
 
     Returns (exceptions, error_result_or_None).
     """
@@ -516,26 +591,98 @@ def _load_central_exceptions(args):
         Path(__file__).parent / CENTRAL_CONFIG_PATH
     )
     central = load_central_config(config_path)
-    exceptions = central["exceptions"]
-
-    return exceptions, None
+    return central["exceptions"], None
 
 
-def _run(args, operator_path):
+def _run_arch_analyzer(arch_analyzer_bin: str, target_dir: str) -> ArchAnalyzerResult:
+    """Extract arch-analyzer JSON for a directory.
+
+    Always runs arch-analyzer fresh — never trusts pre-existing JSON
+    in the target repo (supply chain safety).
+    Raises ArchAnalyzerError if binary missing or extraction fails.
+    """
+    json_path = os.path.join(target_dir, "component-architecture.json")
+
+    if os.path.lexists(json_path):
+        try:
+            os.remove(json_path)
+        except OSError as exc:
+            raise ArchAnalyzerError(
+                f"Failed to remove stale {json_path}: {exc}"
+            ) from exc
+
+    if not os.path.isfile(arch_analyzer_bin):
+        raise ArchAnalyzerError(
+            f"arch-analyzer binary not found at {arch_analyzer_bin}.\n"
+            f"Install with: make install-arch-analyzer"
+        )
+
+    try:
+        subprocess.run(
+            [arch_analyzer_bin, "extract", ".", "--extractors", "docker,kustomize"],
+            cwd=target_dir,
+            capture_output=True, timeout=300, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        stderr_msg = e.stderr.decode(errors='replace') if e.stderr else str(e)
+        raise ArchAnalyzerError(
+            f"arch-analyzer failed on {target_dir}:\n{stderr_msg}"
+        ) from e
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise ArchAnalyzerError(
+            f"arch-analyzer failed on {target_dir}: {e}"
+        ) from e
+
+    if not os.path.isfile(json_path):
+        raise ArchAnalyzerError(
+            f"arch-analyzer did not generate {json_path}"
+        )
+
+    try:
+        with open(json_path) as f:
+            return ArchAnalyzerResult.from_dict(json.load(f))
+    except (json.JSONDecodeError, OSError) as e:
+        raise ArchAnalyzerError(
+            f"Failed to parse {json_path}: {e}"
+        ) from e
+
+
+def _run(args, operator_path, *,
+         manifest=None, manifest_env_vars=None,
+         operator_arch_data=None, log_stream=None):
+    """Run all selected rules on a repo and produce reports.
+
+    Optional keyword args allow callers (e.g. run_all.py) to pass
+    pre-computed operator data to avoid redundant work across repos.
+    *log_stream* overrides sys.stderr for diagnostic output (thread-safe).
+    """
     repo_root = os.path.abspath(args.repo_root)
     repo_name = _get_repo_name(repo_root)
     selected = resolve_rules(args.rules)
-    timing = getattr(args, "timing", False)
+    verbose = getattr(args, "verbose", False)
+    arch_analyzer_bin = getattr(args, "arch_analyzer", "")
+    _stderr = log_stream or sys.stderr
 
-    def _tlog(label, elapsed):
-        if timing:
-            print(f"  [timing] {label}: {elapsed:.1f}s", file=sys.stderr)
+    def _vlog(msg):
+        if verbose:
+            print(f"  [verbose] {msg}", file=_stderr)
 
     t_total = time.monotonic()
 
-    manifest = None
-    manifest_env_vars = None
+    _vlog(f"Repo: {repo_name} at {repo_root}")
+    _vlog(f"Selected rules: {selected}")
 
+    # --- Central config (loaded once, used for exceptions + detect_params_env) ---
+    _central_config_path = args.config or str(Path(__file__).parent / CENTRAL_CONFIG_PATH)
+    central_cfg = load_central_config(_central_config_path)
+    docker_contexts = central_cfg.get("docker_contexts", {}).get(repo_name, {})
+    if not docker_contexts:
+        docker_contexts = central_cfg.get("docker_contexts", {}).get(repo_name.split("/")[-1], {})
+    non_image_prefixes = central_cfg.get("known_non_image_prefixes", [])
+    _pef_map = central_cfg.get("params_env_filenames", {})
+    params_env_extra = (
+        _pef_map.get(repo_name) or _pef_map.get(repo_name.split("/")[-1]) or []
+    )
     need_manifest = "manifest" in selected
     for key in selected:
         if not RULE_REGISTRY[key].get("needs_manifest"):
@@ -547,67 +694,82 @@ def _run(args, operator_path):
                 need_manifest = True
                 break
         elif hasattr(mod, "detect_params_env"):
-            if mod.detect_params_env(Path(repo_root)):
+            if mod.detect_params_env(Path(repo_root), extra_filenames=params_env_extra):
                 need_manifest = True
                 break
 
-    if need_manifest:
+    if need_manifest and manifest is None:
         t0 = time.monotonic()
         manifest, manifest_env_vars = load_manifest(operator_path)
-        _tlog("load_manifest", time.monotonic() - t0)
+        _vlog(f"load_manifest: {time.monotonic() - t0:.1f}s")
 
+    # --- Run arch-analyzer (REQUIRED) ---
+    t0 = time.monotonic()
+    if operator_arch_data is None:
+        operator_arch_data = _run_arch_analyzer(arch_analyzer_bin, operator_path)
+        if operator_arch_data:
+            print("  Loaded operator architecture data", file=_stderr)
+    component_arch_data = _run_arch_analyzer(arch_analyzer_bin, repo_root)
+    if component_arch_data:
+        print("  Loaded component architecture data", file=_stderr)
+    _vlog(f"arch_analyzer: {time.monotonic() - t0:.1f}s")
 
+    # --- Production scope ---
     prod_scope = None
     if not getattr(args, "no_production_scope", False):
         t0 = time.monotonic()
         manifest_source_folders = None
         overlay_paths = None
-        try:
-            op_manifest_mod = importlib.import_module("rules.operator_manifest")
-            repo_basename = os.path.basename(repo_root)
-            if hasattr(op_manifest_mod, "parse_component_manifest_mapping"):
-                mapping = op_manifest_mod.parse_component_manifest_mapping(operator_path)
-                manifest_source_folders = mapping.get(repo_basename)
-                if manifest_source_folders:
-                    print(
-                        f"  Operator mapping: {repo_basename} → {manifest_source_folders}",
-                        file=sys.stderr,
-                    )
-            if hasattr(op_manifest_mod, "parse_component_overlay_paths"):
-                    key_map = op_manifest_mod.parse_repo_component_key(operator_path)
-                    component_key = key_map.get(repo_basename)
-                    if component_key:
-                        overlay_paths = op_manifest_mod.parse_component_overlay_paths(
-                            operator_path, component_key,
-                        )
-                        if overlay_paths:
-                            print(
-                                f"  Overlay paths (auto-detected for {component_key}): {overlay_paths}",
-                                file=sys.stderr,
-                            )
-        except Exception as e:
-            repo_basename = repo_basename if 'repo_basename' in dir() else os.path.basename(repo_root)
+        repo_basename = os.path.basename(repo_root)
+        op_manifest_mod = importlib.import_module("rules.operator_manifest")
+
+        # Parse manifest entries once (both source_folders and component_keys)
+        source_folders_map, component_keys_map = op_manifest_mod.parse_manifest_entries(operator_path)
+        manifest_source_folders = source_folders_map.get(repo_basename)
+        if manifest_source_folders:
             print(
-                f"  WARNING: operator manifest handling failed for "
-                f"{operator_path}/{repo_basename}: {e}",
-                file=sys.stderr,
+                f"  Operator mapping: {repo_basename} → {manifest_source_folders}",
+                file=_stderr,
             )
+
+        # Determine overlay paths
+        if operator_arch_data:
+            component_key = component_keys_map.get(repo_basename)
+            if component_key:
+                raw_overlays = op_manifest_mod.parse_overlay_paths_from_arch_data(
+                    operator_arch_data, component_key,
+                )
+                if raw_overlays and manifest_source_folders:
+                    overlay_paths = [
+                        os.path.join(sf, ov)
+                        for sf in manifest_source_folders
+                        for ov in raw_overlays
+                    ]
+                elif raw_overlays:
+                    overlay_paths = raw_overlays
+                if overlay_paths:
+                    print(
+                        f"  Overlay paths ({component_key}): {overlay_paths}",
+                        file=_stderr,
+                    )
 
         prod_scope = compute_production_scope(
             Path(repo_root),
             manifest_source_folders=manifest_source_folders,
             overlay_paths=overlay_paths,
+            arch_data=component_arch_data,
+            docker_contexts=docker_contexts or None,
         )
-        _tlog("production_scope", time.monotonic() - t0)
+        _vlog(f"production_scope: {time.monotonic() - t0:.1f}s")
         if prod_scope:
             parts = []
-            if prod_scope.production_files:
-                parts.append(f"go={len(prod_scope.production_files)} files")
+            if prod_scope.production_dirs:
+                parts.append(f"{len(prod_scope.production_dirs)} dirs")
             if prod_scope.manifest_files:
-                parts.append(f"manifests={len(prod_scope.manifest_files)} files")
+                parts.append(f"{len(prod_scope.manifest_files)} manifest files")
             print(
                 f"  Production scope: {prod_scope.method} ({', '.join(parts)})",
-                file=sys.stderr,
+                file=_stderr,
             )
 
     results = []
@@ -620,7 +782,7 @@ def _run(args, operator_path):
             if manifest is None:
                 manifest, manifest_env_vars = load_manifest(operator_path)
             results.append(adapt_manifest_result(manifest))
-            _tlog(f"rule {key}", time.monotonic() - t0)
+            _vlog(f"rule {key}: {time.monotonic() - t0:.1f}s")
             continue
 
         kwargs = {}
@@ -628,43 +790,67 @@ def _run(args, operator_path):
             kwargs["manifest_env_vars"] = manifest_env_vars
         if prod_scope is not None:
             kwargs["production_scope"] = prod_scope
+        if component_arch_data:
+            kwargs["arch_data"] = component_arch_data
+        if non_image_prefixes:
+            kwargs["non_image_prefixes"] = non_image_prefixes
+        if key == "params_env" and params_env_extra:
+            kwargs["extra_filenames"] = params_env_extra
         t0 = time.monotonic()
         result = mod.run(repo_root, **kwargs)
-        _tlog(f"rule {key}", time.monotonic() - t0)
+        _vlog(f"rule {key}: {time.monotonic() - t0:.1f}s")
         results.append(result)
 
-    exceptions, error_result = _load_central_exceptions(args)
-    if error_result:
-        results.insert(0, error_result)
-    if exceptions:
-        apply_exceptions(results, exceptions, repo_name)
+    exceptions = central_cfg["exceptions"]
+    exception_hits = apply_exceptions(results, exceptions, repo_name) if exceptions else []
 
     score = compute_score(results)
-    print_summary(score, results)
+    print_summary(score, results, log_file=_stderr)
 
-    if args.report == "json":
-        report = render_json(score, results, repo_name)
-    else:
-        report = render_markdown(score, results, repo_name)
+    formats = [f.strip() for f in args.report.split(",")]
+    _VALID_FORMATS = {"json", "markdown"}
+    for fmt in formats:
+        if fmt not in _VALID_FORMATS:
+            raise SystemExit(f"Unknown report format '{fmt}'. Valid: {', '.join(_VALID_FORMATS)}")
 
-    if args.output:
-        Path(args.output).write_text(report + "\n")
-        print(f"\nReport written to {args.output}", file=sys.stderr)
-    else:
-        print(report)
+    outputs = args.output or []
 
-    _tlog("total", time.monotonic() - t_total)
+    if outputs and len(outputs) != len(formats):
+        raise SystemExit(
+            f"Mismatch: {len(formats)} report format(s) but {len(outputs)} output path(s). "
+            f"Provide one -o per --report format, in the same order."
+        )
+
+    exc_args = dict(exceptions=exceptions, exception_hits=exception_hits)
+
+    for i, fmt in enumerate(formats):
+        if fmt == "json":
+            report = render_json(score, results, repo_name, verbose=verbose, **exc_args)
+        else:
+            report = render_markdown(score, results, repo_name, **exc_args)
+
+        if outputs:
+            Path(outputs[i]).write_text(report + "\n")
+            print(f"\nReport written to {outputs[i]}", file=_stderr)
+        else:
+            print(report)
+
+    _vlog(f"total: {time.monotonic() - t_total:.1f}s")
     return 0 if score != "NOT READY" else 1
 
 
 def main(argv=None):
     args = parse_args(argv)
 
-    if args.operator_path:
-        return _run(args, args.operator_path)
+    try:
+        if args.operator_path:
+            return _run(args, args.operator_path)
 
-    with tempfile.TemporaryDirectory(prefix="odh-operator-") as tmp_dir:
-        return _run(args, tmp_dir)
+        with tempfile.TemporaryDirectory(prefix="odh-operator-") as tmp_dir:
+            return _run(args, tmp_dir)
+    except ArchAnalyzerError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

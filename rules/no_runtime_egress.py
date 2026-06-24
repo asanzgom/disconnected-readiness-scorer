@@ -2,17 +2,18 @@
 """Detect outbound HTTP calls in runtime code that would fail disconnected."""
 
 import re
+import sys
 from pathlib import Path
 
 try:
     from rules.common import (
-        Finding, RuleResult, get_tracked_files, is_in_production_scope,
-        SKIP_DIRS,
+        Finding, RuleResult, get_tracked_files, is_file_in_production_scope,
+        SKIP_DIRS, production_scope_relative_dirs,
     )
 except ModuleNotFoundError:
     from common import (
-        Finding, RuleResult, get_tracked_files, is_in_production_scope,
-        SKIP_DIRS,
+        Finding, RuleResult, get_tracked_files, is_file_in_production_scope,
+        SKIP_DIRS, production_scope_relative_dirs,
     )
 
 EGRESS_PATTERNS = {
@@ -20,6 +21,7 @@ EGRESS_PATTERNS = {
         (re.compile(r'http\.(Get|Post|Head|Do|NewRequest)\s*\('), "http.{method} call", False),
         (re.compile(r'net\.Dial\s*\('), "net.Dial call", False),
         (re.compile(r'http\.DefaultClient'), "http.DefaultClient usage", False),
+        (re.compile(r'exec\.Command\s*\(\s*"git"'), "git subprocess call", False),
     ],
     ".py": [
         (re.compile(r'requests\.(get|post|put|delete|head|patch)\s*\('), "requests.{method} call", False),
@@ -28,6 +30,11 @@ EGRESS_PATTERNS = {
         (re.compile(r'aiohttp\.ClientSession\s*\('), "aiohttp session", False),
         (re.compile(r'subprocess.*(?:curl|wget)'), "curl/wget via subprocess", False),
         (re.compile(r'subprocess.*(?:hf|huggingface.cli).*download'), "HuggingFace download via subprocess", True),
+        (re.compile(r'\bfrom_pretrained\s*\('), "HuggingFace from_pretrained() model download", True),
+        (re.compile(r'\bsnapshot_download\s*\('), "HuggingFace snapshot_download() model download", True),
+        (re.compile(r'\bload_dataset\s*\('), "HuggingFace load_dataset() download", True),
+        (re.compile(r'\bSentenceTransformer\s*\('), "SentenceTransformer model load", True),
+        (re.compile(r'\btorch\.hub\.load\s*\('), "torch.hub.load() model download", True),
     ],
     ".ts": [
         (re.compile(r'fetch\s*\('), "fetch() call", False),
@@ -61,15 +68,45 @@ def has_configurable_url(line: str) -> bool:
     return any(ind in line for ind in indicators)
 
 
-def run(repo_root: str, production_scope=None) -> RuleResult:
+def run(repo_root: str, production_scope=None, **_kwargs) -> RuleResult:
     root = Path(repo_root)
     result = RuleResult(rule="no-runtime-egress")
+    try:
+        return _run_impl(root, result, production_scope)
+    except Exception as exc:
+        import traceback
+        print(traceback.format_exc(), file=sys.stderr)
+        result.passed = False
+        result.findings.append(Finding(
+            severity="blocker",
+            file="",
+            line=0,
+            image="",
+            message=f"Rule crashed: {type(exc).__name__}: {exc}",
+        ))
+        return result
+
+
+def _run_impl(root: Path, result: RuleResult, production_scope) -> RuleResult:
     tracked = get_tracked_files(root)
+
+    result.scan_filters = {
+        "globs": ["**/*"],
+        "extensions": sorted(EGRESS_PATTERNS.keys()),
+        "skip_dirs": sorted(SKIP_DIRS),
+        "tracked_files_only": tracked is not None,
+    }
+    prod_dirs = production_scope_relative_dirs(production_scope, root)
+    if prod_dirs is not None:
+        result.scan_filters["production_scope_dirs"] = prod_dirs
 
     for filepath in root.rglob("*"):
         if tracked is not None and filepath.resolve() not in tracked:
             continue
         if any(d in filepath.parts for d in SKIP_DIRS):
+            continue
+
+        if is_file_in_production_scope(filepath, production_scope) is False:
             continue
 
         suffix = filepath.suffix
@@ -81,7 +118,7 @@ def run(repo_root: str, production_scope=None) -> RuleResult:
         except (OSError, UnicodeDecodeError):
             continue
 
-        in_prod = is_in_production_scope(filepath, production_scope)
+        result.files_checked.append(str(filepath.relative_to(root)))
         patterns = EGRESS_PATTERNS[suffix]
         for i, line in enumerate(lines, 1):
             stripped = line.strip()
@@ -119,10 +156,6 @@ def run(repo_root: str, production_scope=None) -> RuleResult:
                     else:
                         severity = "blocker"
                         msg = f"{desc} — endpoint may not be reachable in disconnected environments."
-
-                if in_prod is False and severity in ("blocker", "warning"):
-                    severity = "info"
-                    msg += " [out of production scope]"
 
                 if severity == "blocker":
                     result.passed = False
