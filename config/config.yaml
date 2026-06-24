@@ -125,7 +125,11 @@ exceptions:
   # (no repo-specific exceptions)
 
   # --- notebooks ---
-  # (no repo-specific exceptions)
+  - rule: "*"
+    repo: notebooks
+    paths:
+      - "scripts/**"
+    reason: "Build-time utilities and CI scripts — not deployed in production"
 
   # --- kserve ---
   - rule: "*"
