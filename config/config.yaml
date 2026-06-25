@@ -157,7 +157,18 @@ exceptions:
   # (no repo-specific exceptions)
 
   # --- model-registry-operator ---
-  # (no repo-specific exceptions)
+  - rule: "image-manifest-complete,no-image-tags"
+    repo: model-registry-operator
+    paths:
+      - "internal/controller/config/defaults.go"
+    images:
+      - "quay.io/opendatahub/model-registry:*"
+      - "quay.io/openshift/origin-oauth-proxy:*"
+      - "quay.io/openshift/origin-kube-rbac-proxy:*"
+      - "quay.io/sclorg/postgresql-16-c10s:*"
+      - "quay.io/opendatahub/odh-model-metadata-collection:*"
+    reason: "Default fallback images — overridden at runtime by env vars wired through params.env → kustomize ConfigMap → Deployment env replacement. Tags replaced by @sha256: digests via Build-Config repos at release time."
+    reference: "https://issues.redhat.com/browse/RHOAIENG-69989"
 
   # --- training-operator ---
   # (no repo-specific exceptions)
