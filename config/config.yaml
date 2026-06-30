@@ -292,7 +292,8 @@ exceptions:
   - rules: params-env-wiring
     repo: workload-variant-autoscaler
     paths:
-      - "config/base/**"
+      - "config/base"
+      - "config/base/manager"
     reason: "Base kustomize manifests — image placeholder is replaced by the OpenShift overlay's params.env → configMapGenerator → replacements wiring"
 
   # --- opendatahub-operator ---
